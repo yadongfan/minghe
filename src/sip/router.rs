@@ -847,6 +847,24 @@ fn build_outbound_request(
         if lower.starts_with("record-route:") {
             continue;
         }
+        if let Some(sanitized) = sanitize_option_tag_header(trimmed, "Supported", Some("k")) {
+            if let Some(header) = sanitized {
+                rewritten.push(header);
+            }
+            continue;
+        }
+        if let Some(sanitized) = sanitize_option_tag_header(trimmed, "Require", None) {
+            if let Some(header) = sanitized {
+                rewritten.push(header);
+            }
+            continue;
+        }
+        if let Some(sanitized) = sanitize_option_tag_header(trimmed, "Proxy-Require", None) {
+            if let Some(header) = sanitized {
+                rewritten.push(header);
+            }
+            continue;
+        }
         if lower.starts_with("contact:") || lower.starts_with("m:") {
             if !contact_uri.is_empty() {
                 rewritten.push(format!("Contact: <{}>", contact_uri));
@@ -867,6 +885,41 @@ fn build_outbound_request(
     result.push_str("\r\n\r\n");
     result.push_str(&body);
     result
+}
+
+fn sanitize_option_tag_header(
+    line: &str,
+    name: &str,
+    compact: Option<&str>,
+) -> Option<Option<String>> {
+    let trimmed = line.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let name_prefix = format!("{}:", name.to_ascii_lowercase());
+    let compact_prefix = compact.map(|c| format!("{}:", c.to_ascii_lowercase()));
+
+    let (header_name, value) = if lower.starts_with(&name_prefix) {
+        (name.to_string(), trimmed[name.len() + 1..].trim())
+    } else if let Some(prefix) = compact_prefix.as_deref() {
+        if lower.starts_with(prefix) {
+            (name.to_string(), trimmed[prefix.len()..].trim())
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    };
+
+    let option_tags: Vec<&str> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty() && !tag.eq_ignore_ascii_case("100rel"))
+        .collect();
+
+    if option_tags.is_empty() {
+        Some(None)
+    } else {
+        Some(Some(format!("{}: {}", header_name, option_tags.join(", "))))
+    }
 }
 
 fn build_forwarded_invite_response(
@@ -1106,6 +1159,59 @@ mod tests {
         assert!(rewritten.contains("Contact: <sip:1001@example.com;transport=tls>\r\n"));
         assert!(!rewritten.contains("caller-device.invalid"));
         assert!(!rewritten.contains("old-proxy.invalid"));
+    }
+
+    #[test]
+    fn outbound_invite_removes_unsupported_100rel_option_tag() {
+        let invite = concat!(
+            "INVITE sip:1002@stale-contact.invalid SIP/2.0\r\n",
+            "Via: SIP/2.0/TLS caller.example.com;branch=z9hG4bKcaller\r\n",
+            "From: <sips:1001@example.com>;tag=caller-tag\r\n",
+            "To: <sips:1002@example.com>\r\n",
+            "Supported: replaces, 100rel, timer\r\n",
+            "Require: 100rel\r\n",
+            "Proxy-Require: 100rel\r\n",
+            "Call-ID: call-1\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Content-Length: 0\r\n\r\n"
+        );
+
+        let rewritten = build_outbound_request(
+            invite,
+            "sip:1002@callee-device.invalid;transport=tls",
+            "example.com",
+            "sip:1001@example.com;transport=tls",
+        );
+
+        assert!(rewritten.contains("Supported: replaces, timer\r\n"));
+        assert!(!rewritten.contains("100rel"));
+        assert!(!rewritten.contains("Require:"));
+        assert!(!rewritten.contains("Proxy-Require:"));
+    }
+
+    #[test]
+    fn outbound_invite_normalizes_compact_supported_header_without_100rel() {
+        let invite = concat!(
+            "INVITE sip:1002@stale-contact.invalid SIP/2.0\r\n",
+            "Via: SIP/2.0/TLS caller.example.com;branch=z9hG4bKcaller\r\n",
+            "From: <sips:1001@example.com>;tag=caller-tag\r\n",
+            "To: <sips:1002@example.com>\r\n",
+            "k: 100rel, replaces\r\n",
+            "Call-ID: call-1\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Content-Length: 0\r\n\r\n"
+        );
+
+        let rewritten = build_outbound_request(
+            invite,
+            "sip:1002@callee-device.invalid;transport=tls",
+            "example.com",
+            "sip:1001@example.com;transport=tls",
+        );
+
+        assert!(rewritten.contains("Supported: replaces\r\n"));
+        assert!(!rewritten.contains("100rel"));
+        assert!(!rewritten.contains("\r\nk:"));
     }
 
     #[test]
