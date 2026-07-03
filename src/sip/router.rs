@@ -871,7 +871,7 @@ fn build_outbound_request(
             continue;
         }
 
-        if let Some(line) = strip_session_timer_header(trimmed) {
+        if let Some(line) = strip_unsupported_negotiation_header(trimmed) {
             rewritten.push(line);
         }
     }
@@ -939,7 +939,7 @@ fn build_forwarded_invite_response(
     response.into_bytes()
 }
 
-fn strip_session_timer_header(line: &str) -> Option<String> {
+fn strip_unsupported_negotiation_header(line: &str) -> Option<String> {
     let Some((name, value)) = line.split_once(':') else {
         return Some(line.to_string());
     };
@@ -952,7 +952,11 @@ fn strip_session_timer_header(line: &str) -> Option<String> {
             let option_tags: Vec<&str> = value
                 .split(',')
                 .map(str::trim)
-                .filter(|tag| !tag.is_empty() && !tag.eq_ignore_ascii_case("timer"))
+                .filter(|tag| {
+                    !tag.is_empty()
+                        && !tag.eq_ignore_ascii_case("timer")
+                        && !tag.eq_ignore_ascii_case("100rel")
+                })
                 .collect();
 
             if option_tags.is_empty() {
@@ -1181,6 +1185,59 @@ mod tests {
         assert!(!rewritten.contains("Session-Expires:"));
         assert!(!rewritten.contains("Min-SE:"));
         assert!(!rewritten.to_ascii_lowercase().contains("timer"));
+    }
+
+    #[test]
+    fn outbound_invite_strips_unsupported_reliable_provisional_negotiation() {
+        let invite = concat!(
+            "INVITE sip:1002@stale-contact.invalid SIP/2.0\r\n",
+            "Via: SIP/2.0/TLS caller.example.com;branch=z9hG4bKcaller\r\n",
+            "From: <sips:1001@example.com>;tag=caller-tag\r\n",
+            "To: <sips:1002@example.com>\r\n",
+            "Contact: <sips:1001@caller-device.invalid;transport=tls>\r\n",
+            "Call-ID: call-1\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Supported: replaces, 100rel, outbound\r\n",
+            "Require: 100rel\r\n",
+            "Proxy-Require: 100rel\r\n",
+            "Content-Length: 0\r\n\r\n"
+        );
+
+        let rewritten = build_outbound_request(
+            invite,
+            "sip:1002@callee-device.invalid;transport=tls",
+            "example.com",
+            "sip:1001@example.com;transport=tls",
+        );
+
+        assert!(rewritten.contains("Supported: replaces, outbound\r\n"));
+        assert!(!rewritten.contains("100rel"));
+        assert!(!rewritten.contains("Require:"));
+        assert!(!rewritten.contains("Proxy-Require:"));
+    }
+
+    #[test]
+    fn outbound_invite_strips_compact_100rel_option_tag() {
+        let invite = concat!(
+            "INVITE sip:1002@stale-contact.invalid SIP/2.0\r\n",
+            "Via: SIP/2.0/TLS caller.example.com;branch=z9hG4bKcaller\r\n",
+            "From: <sips:1001@example.com>;tag=caller-tag\r\n",
+            "To: <sips:1002@example.com>\r\n",
+            "k: 100rel, replaces\r\n",
+            "Call-ID: call-1\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Content-Length: 0\r\n\r\n"
+        );
+
+        let rewritten = build_outbound_request(
+            invite,
+            "sip:1002@callee-device.invalid;transport=tls",
+            "example.com",
+            "sip:1001@example.com;transport=tls",
+        );
+
+        assert!(rewritten.contains("k: replaces\r\n"));
+        assert!(!rewritten.contains("100rel"));
     }
 
     #[test]
