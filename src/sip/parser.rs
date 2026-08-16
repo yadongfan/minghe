@@ -645,6 +645,27 @@ pub fn extract_uri_from_header(msg: &str, header_name: &str) -> Option<String> {
     None
 }
 
+/// 要注入 SDP 的 crypto 行描述（SDES）
+#[derive(Debug, Clone)]
+pub struct SdpCrypto {
+    /// crypto tag（同一媒体段内必须唯一）
+    pub tag: u32,
+    /// 加密套件名称（如 `AES_CM_128_HMAC_SHA1_80`、`AEAD_AES_128_GCM`）
+    pub suite: String,
+    /// Base64 编码的 SDES key||salt（不含 `inline:` 前缀与生命周期参数）
+    pub key_b64: String,
+}
+
+impl SdpCrypto {
+    /// 生成 `a=crypto:TAG SUITE inline:KEY` 行
+    pub fn to_line(&self) -> String {
+        format!(
+            "a=crypto:{} {} inline:{}",
+            self.tag, self.suite, self.key_b64
+        )
+    }
+}
+
 /// 修改 SDP 中的媒体地址和端口，并注入指定的 SDES crypto key
 ///
 /// 将 SDP 中的 c= 行替换为服务器中继地址，
@@ -655,23 +676,46 @@ pub fn rewrite_sdp(sdp: &str, relay_addr: &str, relay_port: u16, crypto_key_b64:
 }
 
 /// 修改 SDP 中的媒体地址和端口，可选注入 SDES crypto key
+///
+/// 单密钥版本：以 tag 1 + `AES_CM_128_HMAC_SHA1_80` 注入。
 pub fn rewrite_sdp_with_crypto(
     sdp: &str,
     relay_addr: &str,
     relay_port: u16,
     crypto_key_b64: Option<&str>,
 ) -> String {
+    let cryptos: Vec<SdpCrypto> = crypto_key_b64
+        .map(|key| {
+            vec![SdpCrypto {
+                tag: 1,
+                suite: "AES_CM_128_HMAC_SHA1_80".to_string(),
+                key_b64: key.to_string(),
+            }]
+        })
+        .unwrap_or_default();
+    rewrite_sdp_with_cryptos(sdp, relay_addr, relay_port, &cryptos)
+}
+
+/// 修改 SDP 中的媒体地址和端口，注入多行 SDES crypto key
+///
+/// 向 m=audio 段注入多个 `a=crypto` 行（不同 tag），供对端选择其支持的加密套件，
+/// 例如同时提供 `AES_CM_128_HMAC_SHA1_80` 与 `AEAD_AES_128_GCM`。
+pub fn rewrite_sdp_with_cryptos(
+    sdp: &str,
+    relay_addr: &str,
+    relay_port: u16,
+    cryptos: &[SdpCrypto],
+) -> String {
     let mut result = Vec::new();
     let mut in_audio = false;
     let mut found_audio = false;
     let mut crypto_inserted = false;
+    let has_crypto = !cryptos.is_empty();
 
     for line in sdp.lines() {
         if line.starts_with("m=") {
-            if in_audio && !crypto_inserted {
-                if let Some(key) = crypto_key_b64 {
-                    result.push(format!("a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{}", key));
-                }
+            if in_audio && !crypto_inserted && has_crypto {
+                push_crypto_lines(&mut result, cryptos);
             }
             in_audio = line.starts_with("m=audio");
             crypto_inserted = false;
@@ -685,7 +729,7 @@ pub fn rewrite_sdp_with_crypto(
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() >= 4 {
                 // m=audio <port> <proto> <formats...>
-                let proto = if crypto_key_b64.is_some() {
+                let proto = if has_crypto {
                     "RTP/SAVP".to_string()
                 } else {
                     parts[2].to_string()
@@ -702,16 +746,14 @@ pub fn rewrite_sdp_with_crypto(
                 result.push(line.to_string());
             }
         } else {
-            if crypto_key_b64.is_some() && should_strip_for_sdes_srtp(line) {
+            if has_crypto && should_strip_for_sdes_srtp(line) {
                 continue;
             }
 
             if in_audio && line.starts_with("a=crypto") {
                 if !crypto_inserted {
-                    if let Some(key) = crypto_key_b64 {
-                        result.push(format!("a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{}", key));
-                        crypto_inserted = true;
-                    }
+                    push_crypto_lines(&mut result, cryptos);
+                    crypto_inserted = true;
                 }
                 continue;
             }
@@ -719,13 +761,22 @@ pub fn rewrite_sdp_with_crypto(
         }
     }
 
-    if in_audio && found_audio && !crypto_inserted {
-        if let Some(key) = crypto_key_b64 {
-            result.push(format!("a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{}", key));
-        }
+    if in_audio && found_audio && !crypto_inserted && has_crypto {
+        push_crypto_lines(&mut result, cryptos);
     }
 
-    result.join("\r\n")
+    // RFC 4566 要求每行（含最后一行）以 CRLF 结束。部分客户端严格的 SDP 解析器
+    // 对最后一行缺少结尾换行的 SDP 会在最后一行处提前终止解析——
+    // 当最后一行恰好是 a=crypto 时，crypto 丢失导致对端判定 answer 不兼容而挂断。
+    let mut sdp = result.join("\r\n");
+    sdp.push_str("\r\n");
+    sdp
+}
+
+fn push_crypto_lines(result: &mut Vec<String>, cryptos: &[SdpCrypto]) {
+    for crypto in cryptos {
+        result.push(crypto.to_line());
+    }
 }
 
 fn should_strip_for_sdes_srtp(line: &str) -> bool {
@@ -967,5 +1018,69 @@ mod tests {
         assert!(rewritten.contains("a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:SERVERKEY"));
         assert!(!rewritten.contains("SESSIONKEY"));
         assert_eq!(rewritten.matches("a=crypto:").count(), 1);
+    }
+
+    #[test]
+    fn test_rewrite_sdp_with_multiple_cryptos() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 192.168.1.10\r\n",
+            "c=IN IP4 192.168.1.10\r\n",
+            "m=audio 4000 RTP/AVP 0 8 101\r\n",
+            "a=rtpmap:0 PCMU/8000\r\n"
+        );
+
+        let cryptos = vec![
+            SdpCrypto {
+                tag: 1,
+                suite: "AES_CM_128_HMAC_SHA1_80".to_string(),
+                key_b64: "KEY_AES_CM".to_string(),
+            },
+            SdpCrypto {
+                tag: 2,
+                suite: "AEAD_AES_128_GCM".to_string(),
+                key_b64: "KEY_GCM".to_string(),
+            },
+        ];
+
+        let rewritten = rewrite_sdp_with_cryptos(sdp, "203.0.113.10", 20000, &cryptos);
+
+        assert!(rewritten.contains("c=IN IP4 203.0.113.10"));
+        assert!(rewritten.contains("m=audio 20000 RTP/SAVP 0 8 101"));
+        assert!(rewritten.contains("a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:KEY_AES_CM"));
+        assert!(rewritten.contains("a=crypto:2 AEAD_AES_128_GCM inline:KEY_GCM"));
+        assert!(rewritten.contains("a=rtpmap:0 PCMU/8000"));
+        assert_eq!(rewritten.matches("a=crypto:").count(), 2);
+    }
+
+    #[test]
+    fn test_rewrite_sdp_without_crypto_keeps_protocol() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 192.168.1.10\r\n",
+            "c=IN IP4 192.168.1.10\r\n",
+            "m=audio 4000 RTP/AVP 0 8\r\n"
+        );
+
+        let rewritten = rewrite_sdp_with_cryptos(sdp, "203.0.113.10", 20000, &[]);
+
+        assert!(rewritten.contains("m=audio 20000 RTP/AVP 0 8"));
+        assert!(!rewritten.contains("a=crypto"));
+    }
+
+    #[test]
+    fn test_rewrite_sdp_ends_with_crlf() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 192.168.1.10\r\n",
+            "c=IN IP4 192.168.1.10\r\n",
+            "m=audio 4000 RTP/AVP 0 8\r\n"
+        );
+
+        let rewritten = rewrite_sdp_with_cryptos(sdp, "203.0.113.10", 20000, &[]);
+
+        // 最后一行必须以 CRLF 结束，否则严格客户端的 SDP 解析器解析最后一行失败
+        assert!(rewritten.ends_with("\r\n"), "SDP 必须以 CRLF 结尾");
+        assert!(!rewritten.ends_with("\r\n\r\n"), "不应有多余空行");
     }
 }

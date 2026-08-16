@@ -5,6 +5,8 @@
 
 use aes::cipher::{BlockEncrypt, KeyInit};
 use aes::Aes128;
+use aes_gcm::aead::Aead;
+use aes_gcm::{Aes128Gcm, Nonce};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use hmac::{Hmac, Mac};
@@ -19,11 +21,66 @@ type HmacSha1 = Hmac<Sha1>;
 /// SRTP 认证标签长度（80 位 = 10 字节）
 const AUTH_TAG_LEN: usize = 10;
 
+/// GCM 认证标签长度（128 位 = 16 字节）
+const GCM_AUTH_TAG_LEN: usize = 16;
+
+/// SRTP 加密套件类型
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SrtpSuite {
+    /// AES-128-CM 载荷加密 + HMAC-SHA1-80 认证（RFC 3711 标准套件）
+    AesCm128HmacSha180,
+    /// AES-128-GCM AEAD 认证加密（RFC 7714）
+    AeadAes128Gcm,
+}
+
+impl SrtpSuite {
+    /// SDP `a=crypto` 属性中的套件名称
+    pub fn sdp_name(&self) -> &'static str {
+        match self {
+            SrtpSuite::AesCm128HmacSha180 => "AES_CM_128_HMAC_SHA1_80",
+            SrtpSuite::AeadAes128Gcm => "AEAD_AES_128_GCM",
+        }
+    }
+
+    /// 认证标签长度（字节）
+    pub fn auth_tag_len(&self) -> usize {
+        match self {
+            SrtpSuite::AesCm128HmacSha180 => AUTH_TAG_LEN,
+            SrtpSuite::AeadAes128Gcm => GCM_AUTH_TAG_LEN,
+        }
+    }
+
+    /// 主盐值长度（字节）
+    ///
+    /// - AES_CM_128_HMAC_SHA1_80：112 位（14 字节，RFC 3711）
+    /// - AEAD_AES_128_GCM：96 位（12 字节，RFC 7714）
+    ///
+    /// SDES `inline:` 密钥总长度为 `主密钥(16) + 盐值`，即 AES_CM 为 30 字节、GCM 为 28 字节。
+    pub fn salt_len(&self) -> usize {
+        match self {
+            SrtpSuite::AesCm128HmacSha180 => MASTER_SALT_LEN,
+            SrtpSuite::AeadAes128Gcm => GCM_SALT_LEN,
+        }
+    }
+
+    /// 根据 SDP 套件名称解析
+    pub fn from_sdp_name(name: &str) -> Option<SrtpSuite> {
+        match name.to_ascii_uppercase().as_str() {
+            "AES_CM_128_HMAC_SHA1_80" => Some(SrtpSuite::AesCm128HmacSha180),
+            "AEAD_AES_128_GCM" => Some(SrtpSuite::AeadAes128Gcm),
+            _ => None,
+        }
+    }
+}
+
 /// 主密钥长度（128 位 = 16 字节）
 const MASTER_KEY_LEN: usize = 16;
 
-/// 主盐值长度（112 位 = 14 字节）
+/// 主盐值长度（112 位 = 14 字节，RFC 3711 AES_CM_128_HMAC_SHA1_80）
 const MASTER_SALT_LEN: usize = 14;
+
+/// AEAD_AES_128_GCM 盐值长度（96 位 = 12 字节，RFC 7714）
+const GCM_SALT_LEN: usize = 12;
 
 /// 会话密钥长度
 const SESSION_KEY_LEN: usize = 16;
@@ -55,6 +112,8 @@ pub enum SrtpError {
     InvalidRtpPacket(String),
     /// SRTP 认证失败
     AuthenticationFailed,
+    /// 加密操作失败
+    EncryptionFailed(String),
     /// Base64 解码失败
     Base64DecodeError(String),
     /// 加密属性解析失败
@@ -67,6 +126,7 @@ impl fmt::Display for SrtpError {
             SrtpError::InvalidSdesKey(msg) => write!(f, "无效的 SDES 密钥: {}", msg),
             SrtpError::InvalidRtpPacket(msg) => write!(f, "无效的 RTP 数据包: {}", msg),
             SrtpError::AuthenticationFailed => write!(f, "SRTP 认证失败"),
+            SrtpError::EncryptionFailed(msg) => write!(f, "SRTP 加密失败: {}", msg),
             SrtpError::Base64DecodeError(msg) => write!(f, "Base64 解码失败: {}", msg),
             SrtpError::CryptoAttributeParseError(msg) => {
                 write!(f, "加密属性解析失败: {}", msg)
@@ -88,6 +148,8 @@ pub type Result<T> = std::result::Result<T, SrtpError>;
 /// - SDES 密钥交换格式
 #[derive(Clone)]
 pub struct SrtpCryptoSuite {
+    /// 加密套件类型
+    suite: SrtpSuite,
     /// 主密钥（128 位）
     master_key: [u8; MASTER_KEY_LEN],
     /// 主盐值（112 位）
@@ -109,16 +171,23 @@ struct SrtpStreamState {
 }
 
 impl SrtpCryptoSuite {
-    /// 创建新的 SRTP 加密套件，随机生成主密钥和盐值
+    /// 创建新的加密套件，随机生成主密钥和盐值
     pub fn new() -> Self {
+        Self::new_with_suite(SrtpSuite::AesCm128HmacSha180)
+    }
+
+    /// 创建指定套件的加密套件，随机生成主密钥和盐值
+    pub fn new_with_suite(suite: SrtpSuite) -> Self {
         let mut master_key = [0u8; MASTER_KEY_LEN];
         let mut master_salt = [0u8; MASTER_SALT_LEN];
 
         let mut rng = rand::thread_rng();
         rng.fill_bytes(&mut master_key);
-        rng.fill_bytes(&mut master_salt);
+        // GCM 使用 96 位盐值（RFC 7714），其余字节保持为 0
+        rng.fill_bytes(&mut master_salt[..suite.salt_len()]);
 
-        let mut suite = Self {
+        let mut suite_inst = Self {
+            suite,
             master_key,
             master_salt,
             session_key: [0u8; SESSION_KEY_LEN],
@@ -126,22 +195,31 @@ impl SrtpCryptoSuite {
             session_auth_key: [0u8; SESSION_AUTH_KEY_LEN],
             stream_states: HashMap::new(),
         };
-        suite.derive_session_keys();
-        suite
+        suite_inst.derive_session_keys();
+        suite_inst
     }
 
     /// 从 SDES inline 密钥（Base64 编码的 key||salt）创建加密套件
     ///
-    /// 输入格式：Base64 编码的 30 字节数据（16 字节密钥 + 14 字节盐值）
+    /// 输入格式：Base64 编码数据，长度为 `主密钥(16) + 盐值`。
+    /// - AES_CM_128_HMAC_SHA1_80：30 字节（16 字节密钥 + 14 字节盐值）
+    /// - AEAD_AES_128_GCM：28 字节（16 字节密钥 + 12 字节盐值，RFC 7714）
     pub fn from_sdes(base64_key_salt: &str) -> Result<Self> {
+        Self::from_sdes_with_suite(SrtpSuite::AesCm128HmacSha180, base64_key_salt)
+    }
+
+    /// 从 SDES inline 密钥创建指定套件的加密套件
+    pub fn from_sdes_with_suite(suite: SrtpSuite, base64_key_salt: &str) -> Result<Self> {
         let decoded = BASE64
             .decode(base64_key_salt.trim())
             .map_err(|e| SrtpError::Base64DecodeError(e.to_string()))?;
 
-        if decoded.len() != MASTER_KEY_LEN + MASTER_SALT_LEN {
+        let expected_len = MASTER_KEY_LEN + suite.salt_len();
+        if decoded.len() != expected_len {
             return Err(SrtpError::InvalidSdesKey(format!(
-                "期望 {} 字节，实际 {} 字节",
-                MASTER_KEY_LEN + MASTER_SALT_LEN,
+                "期望 {} 字节（套件 {}），实际 {} 字节",
+                expected_len,
+                suite.sdp_name(),
                 decoded.len()
             )));
         }
@@ -149,9 +227,10 @@ impl SrtpCryptoSuite {
         let mut master_key = [0u8; MASTER_KEY_LEN];
         let mut master_salt = [0u8; MASTER_SALT_LEN];
         master_key.copy_from_slice(&decoded[..MASTER_KEY_LEN]);
-        master_salt.copy_from_slice(&decoded[MASTER_KEY_LEN..]);
+        master_salt[..suite.salt_len()].copy_from_slice(&decoded[MASTER_KEY_LEN..]);
 
-        let mut suite = Self {
+        let mut suite_inst = Self {
+            suite,
             master_key,
             master_salt,
             session_key: [0u8; SESSION_KEY_LEN],
@@ -159,32 +238,51 @@ impl SrtpCryptoSuite {
             session_auth_key: [0u8; SESSION_AUTH_KEY_LEN],
             stream_states: HashMap::new(),
         };
-        suite.derive_session_keys();
-        Ok(suite)
+        suite_inst.derive_session_keys();
+        Ok(suite_inst)
+    }
+
+    /// 获取加密套件类型
+    pub fn suite(&self) -> SrtpSuite {
+        self.suite
+    }
+
+    /// 获取 SDP 套件名称
+    pub fn suite_name(&self) -> &'static str {
+        self.suite.sdp_name()
+    }
+
+    /// 获取 SDES inline 密钥（Base64 编码的 key||salt，不含前缀与生命周期参数）
+    ///
+    /// 输出长度按套件而定：AES_CM 为 30 字节（key 16 + salt 14），GCM 为 28 字节（key 16 + salt 12）。
+    pub fn to_sdes_key(&self) -> String {
+        let salt_len = self.suite.salt_len();
+        let mut key_salt = Vec::with_capacity(MASTER_KEY_LEN + salt_len);
+        key_salt.extend_from_slice(&self.master_key);
+        key_salt.extend_from_slice(&self.master_salt[..salt_len]);
+        BASE64.encode(&key_salt)
     }
 
     /// 生成 SDES `a=crypto` 属性值
     ///
-    /// 返回格式：`a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:<base64>`
+    /// 返回格式：`a=crypto:1 <SUITE> inline:<base64>`
     pub fn to_sdes_attribute(&self) -> String {
-        let mut key_salt = Vec::with_capacity(MASTER_KEY_LEN + MASTER_SALT_LEN);
-        key_salt.extend_from_slice(&self.master_key);
-        key_salt.extend_from_slice(&self.master_salt);
-        let encoded = BASE64.encode(&key_salt);
-        format!("a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{}", encoded)
+        format!(
+            "a=crypto:1 {} inline:{}",
+            self.suite.sdp_name(),
+            self.to_sdes_key()
+        )
     }
 
     /// 生成 SDP crypto 行
     ///
-    /// 返回格式：`a=crypto:<tag> AES_CM_128_HMAC_SHA1_80 inline:<base64>`
+    /// 返回格式：`a=crypto:<tag> <SUITE> inline:<base64>`
     pub fn to_sdp_crypto_line(&self, tag: u32) -> String {
-        let mut key_salt = Vec::with_capacity(MASTER_KEY_LEN + MASTER_SALT_LEN);
-        key_salt.extend_from_slice(&self.master_key);
-        key_salt.extend_from_slice(&self.master_salt);
-        let encoded = BASE64.encode(&key_salt);
         format!(
-            "a=crypto:{} AES_CM_128_HMAC_SHA1_80 inline:{}",
-            tag, encoded
+            "a=crypto:{} {} inline:{}",
+            tag,
+            self.suite.sdp_name(),
+            self.to_sdes_key()
         )
     }
 
@@ -204,16 +302,19 @@ impl SrtpCryptoSuite {
     /// 使用 AES-CM 伪随机函数（PRF）。
     ///
     /// - label 0x00 → 会话加密密钥（128 位）
-    /// - label 0x01 → 会话盐值（112 位）
-    /// - label 0x02 → 会话认证密钥（160 位）
+    /// - label 0x01 → 会话认证密钥（160 位，仅 AES-CM 套件需要）
+    /// - label 0x02 → 会话盐值（112 位；GCM 套件只使用前 96 位）
     fn derive_session_keys(&mut self) {
         self.session_key = self.prf_derive(LABEL_CIPHER_KEY, SESSION_KEY_LEN);
         // 盐值只有 14 字节，先派生 16 字节再截断
         let salt_full: [u8; SESSION_KEY_LEN] = self.prf_derive(LABEL_SALT, SESSION_KEY_LEN);
         self.session_salt
             .copy_from_slice(&salt_full[..SESSION_SALT_LEN]);
-        // 认证密钥需要 20 字节，可能需要多个 AES 块
-        self.session_auth_key = self.prf_derive_auth(LABEL_AUTH_KEY, SESSION_AUTH_KEY_LEN);
+        // 仅 AES-CM 套件需要 HMAC 认证密钥；GCM 为 AEAD 模式，认证由 GCM 标签完成
+        if self.suite == SrtpSuite::AesCm128HmacSha180 {
+            // 认证密钥需要 20 字节，可能需要多个 AES 块
+            self.session_auth_key = self.prf_derive_auth(LABEL_AUTH_KEY, SESSION_AUTH_KEY_LEN);
+        }
     }
 
     /// AES-CM PRF 派生函数 — 派生最多 16 字节的密钥材料
@@ -292,8 +393,9 @@ impl SrtpCryptoSuite {
     ///
     /// 步骤：
     /// 1. 解析 RTP 头部（至少 12 字节）
-    /// 2. 使用 AES-CM 加密载荷
-    /// 3. 计算并附加 HMAC-SHA1-80 认证标签（10 字节）
+    /// 2. 按套件处理：
+    ///    - AES_CM_128_HMAC_SHA1_80：AES-CM 加密载荷 + HMAC-SHA1-80 认证标签（10 字节）
+    ///    - AEAD_AES_128_GCM：AES-128-GCM 认证加密载荷 + 16 字节认证标签（RFC 7714）
     ///
     /// 输入：完整的 RTP 数据包
     /// 输出：SRTP 数据包 = RTP头部 + 加密载荷 + 认证标签
@@ -325,18 +427,37 @@ impl SrtpCryptoSuite {
         };
         let packet_index: u64 = (roc as u64) * 65536 + header.sequence_number as u64;
 
-        // AES-CM 加密载荷
-        let encrypted_payload = self.aes_cm_encrypt(header.ssrc, packet_index, payload);
+        let srtp_packet = match self.suite {
+            SrtpSuite::AesCm128HmacSha180 => {
+                // AES-CM 加密载荷
+                let encrypted_payload = self.aes_cm_encrypt(header.ssrc, packet_index, payload);
 
-        // 组装 SRTP 数据包（头部不变 + 加密载荷）
-        let mut srtp_packet = Vec::with_capacity(packet.len() + AUTH_TAG_LEN);
-        srtp_packet.extend_from_slice(&packet[..header_len]); // 原始头部
-        srtp_packet.extend_from_slice(&encrypted_payload); // 加密载荷
+                // 组装 SRTP 数据包（头部不变 + 加密载荷）
+                let mut srtp_packet = Vec::with_capacity(packet.len() + AUTH_TAG_LEN);
+                srtp_packet.extend_from_slice(&packet[..header_len]); // 原始头部
+                srtp_packet.extend_from_slice(&encrypted_payload); // 加密载荷
 
-        // 计算 HMAC-SHA1-80 认证标签
-        // 认证范围：SRTP 头部 + 加密载荷 + ROC（4 字节，网络字节序）
-        let auth_tag = self.compute_auth_tag(&srtp_packet, roc);
-        srtp_packet.extend_from_slice(&auth_tag);
+                // 计算 HMAC-SHA1-80 认证标签
+                // 认证范围：SRTP 头部 + 加密载荷 + ROC（4 字节，网络字节序）
+                let auth_tag = self.compute_auth_tag(&srtp_packet, roc);
+                srtp_packet.extend_from_slice(&auth_tag);
+                srtp_packet
+            }
+            SrtpSuite::AeadAes128Gcm => {
+                // AES-128-GCM 认证加密（AAD = RTP 头部，输出密文 + 16 字节标签）
+                let encrypted = self.gcm_encrypt_payload(
+                    header.ssrc,
+                    roc,
+                    header.sequence_number,
+                    &packet[..header_len],
+                    payload,
+                )?;
+                let mut srtp_packet = Vec::with_capacity(packet.len() + GCM_AUTH_TAG_LEN);
+                srtp_packet.extend_from_slice(&packet[..header_len]); // 原始头部
+                srtp_packet.extend_from_slice(&encrypted); // 密文 + 16 字节标签
+                srtp_packet
+            }
+        };
 
         let state = self.stream_state_mut(header.ssrc);
         update_stream_state_after_success(state, header.sequence_number, roc);
@@ -347,13 +468,14 @@ impl SrtpCryptoSuite {
     /// 解密 SRTP 数据包为 RTP 数据包
     ///
     /// 步骤：
-    /// 1. 验证 HMAC-SHA1-80 认证标签
-    /// 2. 使用 AES-CM 解密载荷
+    /// 1. 验证认证标签（HMAC-SHA1-80 或 GCM 认证）
+    /// 2. 解密载荷
     ///
     /// 输入：完整的 SRTP 数据包
     /// 输出：RTP 数据包 = RTP头部 + 明文载荷
     pub fn unprotect_rtp(&mut self, packet: &[u8]) -> Result<Vec<u8>> {
-        if packet.len() < RTP_HEADER_MIN_LEN + AUTH_TAG_LEN {
+        let tag_len = self.suite.auth_tag_len();
+        if packet.len() < RTP_HEADER_MIN_LEN + tag_len {
             return Err(SrtpError::InvalidRtpPacket(format!(
                 "SRTP 数据包太短: {} 字节",
                 packet.len()
@@ -361,7 +483,7 @@ impl SrtpCryptoSuite {
         }
 
         // 分离认证标签
-        let auth_tag_start = packet.len() - AUTH_TAG_LEN;
+        let auth_tag_start = packet.len() - tag_len;
         let authenticated_portion = &packet[..auth_tag_start];
         let received_tag = &packet[auth_tag_start..];
 
@@ -380,24 +502,48 @@ impl SrtpCryptoSuite {
             estimate_roc(*state, header.sequence_number)
         };
 
-        // 验证认证标签
-        let computed_tag = self.compute_auth_tag(authenticated_portion, roc);
-        if !constant_time_eq(&computed_tag, received_tag) {
-            return Err(SrtpError::AuthenticationFailed);
-        }
+        let rtp_packet = match self.suite {
+            SrtpSuite::AesCm128HmacSha180 => {
+                // 验证认证标签
+                let computed_tag = self.compute_auth_tag(authenticated_portion, roc);
+                if !constant_time_eq(&computed_tag, received_tag) {
+                    return Err(SrtpError::AuthenticationFailed);
+                }
 
-        let encrypted_payload = &authenticated_portion[header_len..];
+                let encrypted_payload = &authenticated_portion[header_len..];
 
-        // 计算 packet index
-        let packet_index: u64 = (roc as u64) * 65536 + header.sequence_number as u64;
+                // 计算 packet index
+                let packet_index: u64 = (roc as u64) * 65536 + header.sequence_number as u64;
 
-        // AES-CM 解密（加解密操作相同）
-        let decrypted_payload = self.aes_cm_encrypt(header.ssrc, packet_index, encrypted_payload);
+                // AES-CM 解密（加解密操作相同）
+                let decrypted_payload =
+                    self.aes_cm_encrypt(header.ssrc, packet_index, encrypted_payload);
 
-        // 组装 RTP 数据包
-        let mut rtp_packet = Vec::with_capacity(header_len + decrypted_payload.len());
-        rtp_packet.extend_from_slice(&authenticated_portion[..header_len]);
-        rtp_packet.extend_from_slice(&decrypted_payload);
+                // 组装 RTP 数据包
+                let mut rtp_packet = Vec::with_capacity(header_len + decrypted_payload.len());
+                rtp_packet.extend_from_slice(&authenticated_portion[..header_len]);
+                rtp_packet.extend_from_slice(&decrypted_payload);
+                rtp_packet
+            }
+            SrtpSuite::AeadAes128Gcm => {
+                // AES-128-GCM 解密并验证认证标签（AAD = RTP 头部）。
+                // 注意：GCM 的认证标签必须随密文一起传入 decrypt（与 AES_CM
+                // 的独立 HMAC 标签不同），因此这里直接使用完整 packet 而不分离标签。
+                let plaintext = self.gcm_decrypt_payload(
+                    header.ssrc,
+                    roc,
+                    header.sequence_number,
+                    &packet[..header_len],
+                    &packet[header_len..],
+                )?;
+
+                // 组装 RTP 数据包
+                let mut rtp_packet = Vec::with_capacity(header_len + plaintext.len());
+                rtp_packet.extend_from_slice(&packet[..header_len]);
+                rtp_packet.extend_from_slice(&plaintext);
+                rtp_packet
+            }
+        };
 
         let state = self.stream_state_mut(header.ssrc);
         update_stream_state_after_success(state, header.sequence_number, roc);
@@ -455,6 +601,72 @@ impl SrtpCryptoSuite {
         }
 
         result
+    }
+
+    /// RFC 7714 GCM 套件：构造 96 位 IV
+    ///
+    /// IV = (SSRC || ROC || SEQ) XOR session_salt 低 96 位（12 字节），其中：
+    /// - SSRC：32 位
+    /// - ROC：32 位
+    /// - SEQ：32 位，**高 16 位为 RTP 序列号、低 16 位为 0**（RFC 7714 §4.1，
+    ///   与 libsrtp 等标准实现一致）
+    fn gcm_iv(&self, ssrc: u32, roc: u32, sequence: u16) -> [u8; 12] {
+        let mut iv = [0u8; 12];
+        let ssrc_b = ssrc.to_be_bytes();
+        let roc_b = roc.to_be_bytes();
+        // 序列号左移 16 位：占 32 位字段的高 16 位，低 16 位为 0
+        let seq_b = ((sequence as u32) << 16).to_be_bytes();
+        for i in 0..4 {
+            iv[i] = ssrc_b[i] ^ self.session_salt[i];
+            iv[4 + i] = roc_b[i] ^ self.session_salt[4 + i];
+            iv[8 + i] = seq_b[i] ^ self.session_salt[8 + i];
+        }
+        iv
+    }
+
+    /// AES-128-GCM 认证加密载荷并附加 16 字节认证标签
+    ///
+    /// AAD = RTP 头部（不加密但参与认证），ROC 通过 IV 隐式认证。
+    fn gcm_encrypt_payload(
+        &self,
+        ssrc: u32,
+        roc: u32,
+        sequence: u16,
+        aad: &[u8],
+        payload: &[u8],
+    ) -> Result<Vec<u8>> {
+        let cipher = <Aes128Gcm as aes_gcm::aead::KeyInit>::new_from_slice(&self.session_key)
+            .map_err(|_| SrtpError::InvalidRtpPacket("无效的 GCM 会话密钥".to_string()))?;
+        let iv = self.gcm_iv(ssrc, roc, sequence);
+        let nonce = Nonce::from_slice(&iv);
+        let payload = aes_gcm::aead::Payload { msg: payload, aad };
+        cipher
+            .encrypt(nonce, payload)
+            .map_err(|e| SrtpError::EncryptionFailed(e.to_string()))
+    }
+
+    /// AES-128-GCM 解密载荷并验证 16 字节认证标签
+    ///
+    /// 输入为密文 + 16 字节认证标签，AAD = RTP 头部。
+    fn gcm_decrypt_payload(
+        &self,
+        ssrc: u32,
+        roc: u32,
+        sequence: u16,
+        aad: &[u8],
+        ciphertext_with_tag: &[u8],
+    ) -> Result<Vec<u8>> {
+        let cipher = <Aes128Gcm as aes_gcm::aead::KeyInit>::new_from_slice(&self.session_key)
+            .map_err(|_| SrtpError::InvalidRtpPacket("无效的 GCM 会话密钥".to_string()))?;
+        let iv = self.gcm_iv(ssrc, roc, sequence);
+        let nonce = Nonce::from_slice(&iv);
+        let payload = aes_gcm::aead::Payload {
+            msg: ciphertext_with_tag,
+            aad,
+        };
+        cipher
+            .decrypt(nonce, payload)
+            .map_err(|_| SrtpError::AuthenticationFailed)
     }
 
     /// 计算 HMAC-SHA1-80 认证标签
@@ -521,6 +733,7 @@ impl Default for SrtpCryptoSuite {
 impl fmt::Debug for SrtpCryptoSuite {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SrtpCryptoSuite")
+            .field("suite", &self.suite)
             .field("master_key", &"[REDACTED]")
             .field("stream_states", &self.stream_states.len())
             .finish()
@@ -792,9 +1005,200 @@ mod tests {
         assert_eq!(decrypted, rtp_packet);
     }
 
+    /// 测试 GCM 加密解密往返
+    #[test]
+    fn test_gcm_roundtrip() {
+        let mut suite = SrtpCryptoSuite::new_with_suite(SrtpSuite::AeadAes128Gcm);
+
+        let mut rtp_packet = make_rtp_packet(0x12345678, 1, b"Hello, GCM SRTP!");
+
+        let srtp_packet = suite.protect_rtp(&rtp_packet).unwrap();
+
+        // GCM 认证标签 16 字节
+        assert_eq!(srtp_packet.len(), rtp_packet.len() + GCM_AUTH_TAG_LEN);
+
+        let decrypted = suite.unprotect_rtp(&srtp_packet).unwrap();
+        assert_eq!(decrypted, rtp_packet);
+    }
+
+    /// 测试 GCM 不同密钥无法解密
+    #[test]
+    fn test_gcm_different_keys_fail() {
+        let mut suite1 = SrtpCryptoSuite::new_with_suite(SrtpSuite::AeadAes128Gcm);
+        let mut suite2 = SrtpCryptoSuite::new_with_suite(SrtpSuite::AeadAes128Gcm);
+
+        let rtp = make_rtp_packet(0x11111111, 5, b"key mismatch");
+        let srtp = suite1.protect_rtp(&rtp).unwrap();
+        assert!(suite2.unprotect_rtp(&srtp).is_err());
+    }
+
+    /// 测试 GCM 认证标签篡改检测
+    #[test]
+    fn test_gcm_auth_tag_tamper_detection() {
+        let mut suite = SrtpCryptoSuite::new_with_suite(SrtpSuite::AeadAes128Gcm);
+
+        let rtp = make_rtp_packet(0x22222222, 7, b"tamper test");
+        let mut srtp = suite.protect_rtp(&rtp).unwrap();
+        let last = srtp.len() - 1;
+        srtp[last] ^= 0xFF;
+        assert!(suite.unprotect_rtp(&srtp).is_err());
+    }
+
+    /// 测试 GCM 套件的 SDES 属性生成与解析
+    #[test]
+    fn test_gcm_sdes_attribute() {
+        let suite = SrtpCryptoSuite::new_with_suite(SrtpSuite::AeadAes128Gcm);
+        let attr = suite.to_sdes_attribute();
+        assert!(attr.contains("AEAD_AES_128_GCM"));
+
+        let (tag, suite_name, key) = parse_crypto_attribute(&attr).unwrap();
+        assert_eq!(tag, 1);
+        assert_eq!(suite_name, "AEAD_AES_128_GCM");
+
+        let restored =
+            SrtpCryptoSuite::from_sdes_with_suite(SrtpSuite::AeadAes128Gcm, &key).unwrap();
+        assert_eq!(restored.master_key, suite.master_key);
+        assert_eq!(restored.master_salt, suite.master_salt);
+    }
+
+    /// 测试 RFC 7714 标准的 28 字节 GCM SDES 密钥（16 字节 key + 12 字节 salt）可解析
+    ///
+    /// 使用标准格式的 28 字节 key（与主流客户端 offer 中的 GCM key 一致）。
+    /// 修复前服务器误按 AES_CM 的 30 字节校验，导致 GCM 密钥被拒绝、
+    /// answer 与 offer 的 crypto tag 不匹配，对端 SRTP 协商失败立即挂断。
+    #[test]
+    fn test_gcm_sdes_28_byte_key_roundtrip() {
+        let key_b64 = "T0iUsU5QGv2+xlg/kQvFyiymq969VLNgWOjf+w==";
+        assert_eq!(BASE64.decode(key_b64).unwrap().len(), MASTER_KEY_LEN + GCM_SALT_LEN);
+
+        let restored =
+            SrtpCryptoSuite::from_sdes_with_suite(SrtpSuite::AeadAes128Gcm, key_b64).unwrap();
+        // GCM 盐值只有 12 字节，其余字节必须保持为 0
+        assert_eq!(
+            &restored.master_salt[GCM_SALT_LEN..],
+            &[0u8; MASTER_SALT_LEN - GCM_SALT_LEN]
+        );
+
+        // 生成侧输出也必须是 28 字节，往返一致
+        let gen = SrtpCryptoSuite::new_with_suite(SrtpSuite::AeadAes128Gcm);
+        let gen_key = gen.to_sdes_key();
+        assert_eq!(
+            BASE64.decode(&gen_key).unwrap().len(),
+            MASTER_KEY_LEN + GCM_SALT_LEN
+        );
+        let gen_restored =
+            SrtpCryptoSuite::from_sdes_with_suite(SrtpSuite::AeadAes128Gcm, &gen_key).unwrap();
+        assert_eq!(gen_restored.master_key, gen.master_key);
+        assert_eq!(gen_restored.master_salt, gen.master_salt);
+    }
+
+    /// 测试 GCM 与 AES_CM 套件互不兼容（跨套件解密必须失败）
+    #[test]
+    fn test_gcm_and_aes_cm_incompatible() {
+        let mut gcm = SrtpCryptoSuite::new_with_suite(SrtpSuite::AeadAes128Gcm);
+        let mut aes = SrtpCryptoSuite::new();
+
+        let rtp = make_rtp_packet(0x33333333, 9, b"cross suite");
+        let gcm_srtp = gcm.protect_rtp(&rtp).unwrap();
+        assert!(aes.unprotect_rtp(&gcm_srtp).is_err());
+
+        let aes_srtp = aes.protect_rtp(&rtp).unwrap();
+        assert!(gcm.unprotect_rtp(&aes_srtp).is_err());
+    }
+
+    /// 测试 GCM IV 构造（RFC 7714 §4.1：96 位 IV = (SSRC || ROC || SEQ) XOR salt，
+    /// 其中 SEQ 为 32 位、高 16 位是序列号、低 16 位为 0——与 libsrtp 等标准实现一致）
+    #[test]
+    fn test_gcm_iv_construction() {
+        let suite = SrtpCryptoSuite {
+            suite: SrtpSuite::AeadAes128Gcm,
+            master_key: [0u8; MASTER_KEY_LEN],
+            master_salt: [0u8; MASTER_SALT_LEN],
+            session_key: [0u8; SESSION_KEY_LEN],
+            session_salt: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+            session_auth_key: [0u8; SESSION_AUTH_KEY_LEN],
+            stream_states: HashMap::new(),
+        };
+
+        let ssrc = 0x11223344u32;
+        let roc = 0x55667788u32;
+        let seq = 0x99AAu16;
+
+        let iv = suite.gcm_iv(ssrc, roc, seq);
+
+        let mut expected = [0u8; 12];
+        let mut parts = [0u8; 12];
+        parts[0..4].copy_from_slice(&ssrc.to_be_bytes());
+        parts[4..8].copy_from_slice(&roc.to_be_bytes());
+        // 序列号占 32 位字段的高 16 位，低 16 位为 0
+        parts[8..12].copy_from_slice(&((seq as u32) << 16).to_be_bytes());
+        for i in 0..12 {
+            expected[i] = parts[i] ^ suite.session_salt[i];
+        }
+        assert_eq!(&iv[..], &expected[..]);
+
+        // 显式断言 SEQ 位于高 16 位（iv[8..10]），低 16 位为 0（iv[10..12] 仅由 salt 决定）
+        assert_eq!(iv[8], suite.session_salt[8] ^ ((seq >> 8) as u8));
+        assert_eq!(iv[9], suite.session_salt[9] ^ (seq as u8));
+        assert_eq!(iv[10], suite.session_salt[10]);
+        assert_eq!(iv[11], suite.session_salt[11]);
+    }
+
+    /// 与 libsrtp 标准向量一致性的 IV 构造验证
+    ///
+    /// libsrtp 的 GCM IV：IV[0..3]=SSRC、IV[4..7]=ROC、IV[8..9]=seq 高字节/低字节、
+    /// IV[10..11]=0，再与 12 字节 salt 逐字节 XOR。
+    #[test]
+    fn test_gcm_iv_matches_libsrtp_layout() {
+        let suite = SrtpCryptoSuite {
+            suite: SrtpSuite::AeadAes128Gcm,
+            master_key: [0u8; MASTER_KEY_LEN],
+            master_salt: [0u8; MASTER_SALT_LEN],
+            session_key: [0u8; SESSION_KEY_LEN],
+            session_salt: [0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB, 0, 0],
+            session_auth_key: [0u8; SESSION_AUTH_KEY_LEN],
+            stream_states: HashMap::new(),
+        };
+
+        let ssrc = 0xDEADBEEFu32;
+        let roc = 0x00000001u32;
+        let seq = 0x1234u16;
+
+        let iv = suite.gcm_iv(ssrc, roc, seq);
+
+        // 期望：IV = (SSRC || ROC || (seq<<16)) XOR salt
+        let mut expected = [0u8; 12];
+        expected[0..4].copy_from_slice(&(ssrc ^ 0xA0A1A2A3u32).to_be_bytes());
+        expected[4..8].copy_from_slice(&(roc ^ 0xA4A5A6A7u32).to_be_bytes());
+        expected[8] = (seq >> 8) as u8 ^ 0xA8; // 高字节
+        expected[9] = (seq & 0xFF) as u8 ^ 0xA9; // 低字节
+        expected[10] = 0 ^ 0xAA; // 低 16 位为 0
+        expected[11] = 0 ^ 0xAB;
+        assert_eq!(iv, expected);
+    }
+
+    /// 测试 SDP 套件名称解析
+    #[test]
+    fn test_suite_from_sdp_name() {
+        assert_eq!(
+            SrtpSuite::from_sdp_name("AES_CM_128_HMAC_SHA1_80"),
+            Some(SrtpSuite::AesCm128HmacSha180)
+        );
+        assert_eq!(
+            SrtpSuite::from_sdp_name("AEAD_AES_128_GCM"),
+            Some(SrtpSuite::AeadAes128Gcm)
+        );
+        assert_eq!(
+            SrtpSuite::from_sdp_name("aead_aes_128_gcm"),
+            Some(SrtpSuite::AeadAes128Gcm)
+        );
+        assert_eq!(SrtpSuite::from_sdp_name("AES_CM_128_HMAC_SHA1_32"), None);
+    }
+
     #[test]
     fn test_aes_cm_iv_uses_left_aligned_session_salt() {
         let suite = SrtpCryptoSuite {
+            suite: SrtpSuite::AesCm128HmacSha180,
             master_key: [0u8; MASTER_KEY_LEN],
             master_salt: [0u8; MASTER_SALT_LEN],
             session_key: [0u8; SESSION_KEY_LEN],
@@ -837,6 +1241,7 @@ mod tests {
     #[test]
     fn test_kdf_iv_uses_left_aligned_master_salt() {
         let mut suite = SrtpCryptoSuite {
+            suite: SrtpSuite::AesCm128HmacSha180,
             master_key: [0u8; MASTER_KEY_LEN],
             master_salt: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
             session_key: [0u8; SESSION_KEY_LEN],
@@ -859,6 +1264,7 @@ mod tests {
     #[test]
     fn test_kdf_uses_rfc3711_srtp_labels() {
         let mut suite = SrtpCryptoSuite {
+            suite: SrtpSuite::AesCm128HmacSha180,
             master_key: [0u8; MASTER_KEY_LEN],
             master_salt: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
             session_key: [0u8; SESSION_KEY_LEN],

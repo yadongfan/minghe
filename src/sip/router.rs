@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use super::parser;
 use super::registrar::RegistrarService;
 use crate::media::relay::MediaRelayManager;
-use crate::media::srtp::{parse_crypto_attribute, SrtpCryptoSuite};
+use crate::media::srtp::{parse_crypto_attribute, SrtpCryptoSuite, SrtpSuite};
 
 /// 呼叫状态
 #[derive(Debug, Clone, PartialEq)]
@@ -53,12 +53,16 @@ pub struct CallInfo {
     pub callee_writer: Option<mpsc::Sender<Vec<u8>>>,
     /// 主叫原始 offer 中的 SRTP 密钥（用于解密主叫发来的媒体）
     pub caller_remote_crypto: Option<SrtpCryptoSuite>,
+    /// 主叫原始 offer 中被选中的 crypto tag（回 answer 时必须使用相同 tag，RFC 4568）
+    pub caller_remote_crypto_tag: u32,
     /// 服务端转发给主叫的 answer 密钥（用于加密发给主叫的媒体）
     pub caller_local_crypto: Option<SrtpCryptoSuite>,
     /// 被叫 answer 中的 SRTP 密钥（用于解密被叫发来的媒体）
     pub callee_remote_crypto: Option<SrtpCryptoSuite>,
-    /// 服务端转发给被叫的 offer 密钥（用于加密发给被叫的媒体）
+    /// 服务端转发给被叫的 offer 密钥（AES_CM_128_HMAC_SHA1_80，tag 1，用于加密发给被叫的媒体）
     pub callee_local_crypto: Option<SrtpCryptoSuite>,
+    /// 服务端转发给被叫的 offer 密钥（AEAD_AES_128_GCM，tag 2，被叫选择 GCM 时用于加密发给被叫的媒体）
+    pub callee_local_crypto_gcm: Option<SrtpCryptoSuite>,
     /// 主叫 SDP 中声明的媒体地址
     pub caller_media_addr: Option<SocketAddr>,
     /// 被叫 answer SDP 中声明的媒体地址
@@ -202,22 +206,25 @@ impl Router {
             }
         };
 
-        let caller_remote_crypto = match extract_srtp_crypto_from_sdp(&invite_body) {
-            Some(crypto) => {
-                tracing::debug!(
-                    "主叫 {} 提供 a=crypto，使用强制 SRTP B2BUA 模式",
-                    caller_ext
-                );
-                crypto
-            }
-            None => {
-                tracing::warn!(
-                    "拒绝 INVITE：强制 SRTP 模式要求主叫 SDP 携带 a=crypto (Call-ID={})",
-                    call_id
-                );
-                return parser::build_response(request_text, 488, "Not Acceptable Here");
-            }
-        };
+        let (caller_remote_crypto_tag, caller_remote_crypto) =
+            match extract_srtp_crypto_from_sdp(&invite_body) {
+                Some((tag, crypto)) => {
+                    tracing::debug!(
+                        "主叫 {} 提供 a=crypto (tag={}, suite={})，使用强制 SRTP B2BUA 模式",
+                        caller_ext,
+                        tag,
+                        crypto.suite_name()
+                    );
+                    (tag, crypto)
+                }
+                None => {
+                    tracing::warn!(
+                        "拒绝 INVITE：强制 SRTP 模式要求主叫 SDP 携带 a=crypto (Call-ID={})",
+                        call_id
+                    );
+                    return parser::build_response(request_text, 488, "Not Acceptable Here");
+                }
+            };
         let caller_media_addr = extract_audio_media_addr_from_sdp(&invite_body);
 
         // 分配媒体中继端口
@@ -230,17 +237,31 @@ impl Router {
         };
 
         // 强制 SRTP：服务端分别向主叫、被叫声明自己的 SRTP 密钥。
-        let caller_local_crypto = SrtpCryptoSuite::new();
-        let callee_local_crypto = SrtpCryptoSuite::new();
+        // 主叫侧使用主叫 offer 中被选中的套件（与 answer 保持一致）；
+        // 被叫侧同时提供 AES_CM_128 与 AEAD_AES_128_GCM 两种套件，供被叫选择。
+        let caller_local_crypto = SrtpCryptoSuite::new_with_suite(caller_remote_crypto.suite());
+        let callee_local_crypto = SrtpCryptoSuite::new(); // AES_CM_128 (tag 1)
+        let callee_local_crypto_gcm =
+            SrtpCryptoSuite::new_with_suite(SrtpSuite::AeadAes128Gcm); // AEAD_AES_128_GCM (tag 2)
 
         // 修改 SDP：替换媒体地址和端口，并强制声明 RTP/SAVP + SDES crypto
-        let callee_sdes = callee_local_crypto.to_sdes_attribute();
-        let callee_key = callee_sdes.split("inline:").nth(1).unwrap_or_default();
-        let new_sdp = parser::rewrite_sdp(
+        let callee_cryptos = vec![
+            parser::SdpCrypto {
+                tag: 1,
+                suite: callee_local_crypto.suite_name().to_string(),
+                key_b64: callee_local_crypto.to_sdes_key(),
+            },
+            parser::SdpCrypto {
+                tag: 2,
+                suite: callee_local_crypto_gcm.suite_name().to_string(),
+                key_b64: callee_local_crypto_gcm.to_sdes_key(),
+            },
+        ];
+        let new_sdp = parser::rewrite_sdp_with_cryptos(
             &invite_body,
             &self.media_addr,
             relay_session.callee_port,
-            callee_key,
+            &callee_cryptos,
         );
 
         let target_uri = registered_contact_uri(&callee_ext, &self.domain, &self.registrar);
@@ -272,9 +293,11 @@ impl Router {
             caller_writer: caller_writer.clone(),
             callee_writer: Some(callee_writer.clone()),
             caller_remote_crypto: Some(caller_remote_crypto),
+            caller_remote_crypto_tag,
             caller_local_crypto: Some(caller_local_crypto),
             callee_remote_crypto: None,
             callee_local_crypto: Some(callee_local_crypto),
+            callee_local_crypto_gcm: Some(callee_local_crypto_gcm),
             caller_media_addr,
             callee_media_addr: None,
             caller_relay_port: relay_session.caller_port,
@@ -350,7 +373,7 @@ impl Router {
                     if call.callee_remote_contact.is_none() {
                         call.callee_remote_contact = parser::extract_contact_uri(response_text);
                     }
-                    if let Some(crypto) = parser::extract_body(response_text)
+                    if let Some((_, crypto)) = parser::extract_body(response_text)
                         .as_deref()
                         .and_then(extract_srtp_crypto_from_sdp)
                     {
@@ -404,18 +427,15 @@ impl Router {
         // 这样 Via、From、To、CSeq、Call-ID 都和主叫的原始请求匹配
         let forwarded_response = if let Some(body) = parser::extract_body(response_text) {
             // 有 SDP body — 修改媒体地址和端口，并强制写回 SRTP 参数
-            let caller_key = match {
+            let caller_crypto = match {
                 let calls = self.active_calls.read().unwrap();
                 if let Some(call) = calls.get(&call_id) {
-                    call.caller_local_crypto.as_ref().map(|crypto| {
-                        let sdes = crypto.to_sdes_attribute();
-                        sdes.split("inline:").nth(1).unwrap_or_default().to_string()
-                    })
+                    call.caller_local_crypto.clone()
                 } else {
                     None
                 }
             } {
-                Some(key) => key,
+                Some(crypto) => crypto,
                 None => {
                     tracing::error!(
                         "内部错误：强制 SRTP 模式缺少主叫侧本地 crypto (Call-ID={})",
@@ -431,7 +451,32 @@ impl Router {
                 }
             };
 
-            let new_sdp = parser::rewrite_sdp(&body, &media_addr, caller_relay_port, &caller_key);
+            // 主叫侧 answer 注入与主叫 offer 协商一致的加密套件。
+            // 关键：answer 必须使用主叫 offer 中被选中 crypto 的相同 tag（RFC 4568），
+            // 否则严格实现的客户端会判定 SRTP 协商失败并立即挂断。
+            let caller_crypto_tag = {
+                let calls = self.active_calls.read().unwrap();
+                calls
+                    .get(&call_id)
+                    .map(|c| c.caller_remote_crypto_tag)
+                    .unwrap_or(1)
+            };
+            let caller_cryptos = vec![parser::SdpCrypto {
+                tag: caller_crypto_tag,
+                suite: caller_crypto.suite_name().to_string(),
+                key_b64: caller_crypto.to_sdes_key(),
+            }];
+            let new_sdp = parser::rewrite_sdp_with_cryptos(
+                &body,
+                &media_addr,
+                caller_relay_port,
+                &caller_cryptos,
+            );
+            // 确保 crypto 行不是 SDP 最后一行：部分客户端严格的 SDP 解析器
+            // 对"crypto 作为最后一行"的解析会提前终止，导致 crypto 丢失、
+            // 主叫侧判定 answer 不兼容而挂断。这里在末尾补一行无副作用的
+            // 媒体属性（a=ptime），使 crypto 不再位于最后一行。
+            let new_sdp = ensure_answer_crypto_not_last_line(&new_sdp);
             // 使用原始 INVITE 头部构建带 SDP 的响应
             let reason = match status_code {
                 100 => "Trying",
@@ -726,7 +771,14 @@ impl Router {
             let media_addr = self.media_addr.clone();
             let call_id_clone = call_id.to_string();
             let caller_decrypt_crypto = call.caller_remote_crypto.clone();
-            let callee_encrypt_crypto = call.callee_local_crypto.clone();
+            // 根据被叫 answer 中选定的套件，选择对应的本地加密套件（被叫选 GCM 时使用 GCM 实例）
+            let callee_encrypt_crypto = match call.callee_remote_crypto.as_ref().map(|c| c.suite()) {
+                Some(SrtpSuite::AeadAes128Gcm) => call
+                    .callee_local_crypto_gcm
+                    .clone()
+                    .or_else(|| call.callee_local_crypto.clone()),
+                _ => call.callee_local_crypto.clone(),
+            };
             let callee_decrypt_crypto = call.callee_remote_crypto.clone();
             let caller_encrypt_crypto = call.caller_local_crypto.clone();
             let caller_media_addr = call.caller_media_addr;
@@ -1022,33 +1074,72 @@ fn extract_called_extension(request: &str) -> Option<String> {
         })
 }
 
-fn extract_srtp_crypto_from_sdp(sdp: &str) -> Option<SrtpCryptoSuite> {
+/// 确保 answer 的 crypto 行不是 SDP 最后一行
+///
+/// 部分客户端严格的 SDP 解析器对"crypto 作为最后一行"的 SDP 解析会在
+/// crypto 行处提前终止（crypto 丢失 → 主叫侧判定 answer 不兼容而挂断）。
+///
+/// 这里在缺少 ptime 声明时在末尾补一行 `a=ptime:20`，使 crypto 不再位于最后一行。
+/// 之所以不用 `a=rtcp` 补行：媒体中继只监听 RTP 端口、未监听 RTCP 端口，
+/// 声明 `a=rtcp` 会向对端承诺一个并不存在的端口；而 `a=ptime` 只是媒体打包
+/// 时长建议（20ms 为常见默认），无端口等副作用，且主流客户端的 answer 中通常
+/// 不包含该行，不会造成重复。
+fn ensure_answer_crypto_not_last_line(sdp: &str) -> String {
+    let has_ptime = sdp
+        .lines()
+        .any(|l| l.trim_start().to_ascii_lowercase().starts_with("a=ptime"));
+    if has_ptime {
+        return sdp.to_string();
+    }
+    let trimmed = sdp.trim_end_matches('\n').trim_end_matches('\r');
+    format!("{}\r\na=ptime:20\r\n", trimmed)
+}
+
+/// 从 SDP 中提取首个受支持的 SRTP crypto（tag, 密钥）
+///
+/// 返回 crypto 的 tag 与被选中的套件实例。tag 用于回 answer 时保持与 offer 一致（RFC 4568）。
+///
+/// 选择策略：优先 AES_CM_128_HMAC_SHA1_80（RFC 3711 的 30 字节密钥，所有 SRTP 客户端
+/// 兼容性最好），AEAD_AES_128_GCM 作为备选——部分严格客户端作为 offerer 收到
+/// GCM answer 时存在 SRTP 初始化兼容问题，而 AES_CM 路径稳定。
+fn extract_srtp_crypto_from_sdp(sdp: &str) -> Option<(u32, SrtpCryptoSuite)> {
+    let mut gcm_fallback: Option<(u32, SrtpCryptoSuite)> = None;
+
     for line in sdp.lines() {
         let trimmed = line.trim();
         let lower = trimmed.to_ascii_lowercase();
         if lower.starts_with("a=crypto") || lower.starts_with("crypto:") {
             match parse_crypto_attribute(trimmed) {
-                Ok((_, suite, key)) if suite.eq_ignore_ascii_case("AES_CM_128_HMAC_SHA1_80") => {
-                    match SrtpCryptoSuite::from_sdes(&key) {
-                        Ok(crypto) => return Some(crypto),
-                        Err(e) => {
-                            tracing::warn!("无法解析 SDP crypto 密钥 '{}': {}", trimmed, e);
+                Ok((tag, suite, key)) => match SrtpSuite::from_sdp_name(&suite) {
+                    Some(srtp_suite) => {
+                        match SrtpCryptoSuite::from_sdes_with_suite(srtp_suite, &key) {
+                            Ok(crypto) => {
+                                if srtp_suite == SrtpSuite::AesCm128HmacSha180 {
+                                    return Some((tag, crypto));
+                                }
+                                if gcm_fallback.is_none() {
+                                    gcm_fallback = Some((tag, crypto));
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("无法解析 SDP crypto 密钥 '{}': {}", trimmed, e);
+                            }
                         }
                     }
-                }
-                Ok((_, suite, _)) => {
-                    tracing::warn!(
-                        "拒绝不支持的 SRTP crypto suite '{}': 当前仅支持 AES_CM_128_HMAC_SHA1_80",
-                        suite
-                    );
-                }
+                    None => {
+                        tracing::warn!(
+                            "拒绝不支持的 SRTP crypto suite '{}': 当前仅支持 AES_CM_128_HMAC_SHA1_80 与 AEAD_AES_128_GCM",
+                            suite
+                        );
+                    }
+                },
                 Err(e) => {
                     tracing::warn!("无法解析 SDP crypto 行 '{}': {}", trimmed, e);
                 }
             }
         }
     }
-    None
+    gcm_fallback
 }
 
 fn extract_audio_media_addr_from_sdp(sdp: &str) -> Option<SocketAddr> {
@@ -1354,6 +1445,53 @@ mod tests {
     }
 
     #[test]
+    fn ensure_answer_crypto_not_last_appends_ptime_when_missing() {
+        // crypto 是最后一行时，补 a=ptime 行（无端口副作用），使 crypto 不再垫底。
+        // 使用 RFC 5737 文档保留地址（192.0.2.0/24）作为示例 IP。
+        let sdp = concat!(
+            "v=0\r\n",
+            "m=audio 20000 RTP/SAVP 0 101\r\n",
+            "c=IN IP4 192.0.2.1\r\n",
+            "a=sendrecv\r\n",
+            "a=rtpmap:0 PCMU/8000\r\n",
+            "a=crypto:2 AES_CM_128_HMAC_SHA1_80 inline:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\n"
+        );
+
+        let out = ensure_answer_crypto_not_last_line(sdp);
+
+        assert!(out.ends_with("a=crypto:2 AES_CM_128_HMAC_SHA1_80 inline:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\na=ptime:20\r\n"));
+        // 已存在 ptime 时保持原样
+        let sdp2 = format!("{}\r\na=ptime:20\r\n", sdp.trim_end());
+        assert_eq!(ensure_answer_crypto_not_last_line(&sdp2), sdp2);
+    }
+
+    #[test]
+    fn ensure_answer_crypto_not_last_ignores_other_attributes() {
+        // 带 a=rtcp-xr / a=record:off / a=rtcp-fb 等属性时仍需补 ptime，
+        // 否则 crypto 仍是最后一行导致主叫侧解析失败。
+        // 使用 RFC 5737 文档保留地址（192.0.2.0/24）作为示例 IP。
+        let sdp = concat!(
+            "v=0\r\n",
+            "o=- 1193 2764 IN IP4 192.0.2.55\r\n",
+            "s=Talk\r\n",
+            "c=IN IP4 192.0.2.1\r\n",
+            "t=0 0\r\n",
+            "a=rtcp-xr:rcvr-rtt=all:10000 stat-summary=loss,dup,jitt,TTL voip-metrics\r\n",
+            "a=record:off\r\n",
+            "m=audio 20016 RTP/SAVP 0 8 101\r\n",
+            "a=rtpmap:101 telephone-event/8000\r\n",
+            "a=rtcp-fb:* trr-int 1000\r\n",
+            "a=rtcp-fb:* ccm tmmbr\r\n",
+            "a=crypto:2 AES_CM_128_HMAC_SHA1_80 inline:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\n"
+        );
+
+        let out = ensure_answer_crypto_not_last_line(sdp);
+
+        assert!(out.ends_with("a=crypto:2 AES_CM_128_HMAC_SHA1_80 inline:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\na=ptime:20\r\n"));
+        assert!(out.contains("a=rtcp-xr:rcvr-rtt=all:10000"));
+    }
+
+    #[test]
     fn extracts_only_supported_srtp_crypto_suite() {
         let supported = concat!(
             "v=0\r\n",
@@ -1368,6 +1506,49 @@ mod tests {
 
         assert!(extract_srtp_crypto_from_sdp(supported).is_some());
         assert!(extract_srtp_crypto_from_sdp(unsupported).is_none());
+    }
+
+    #[test]
+    fn extracts_gcm_crypto_with_offer_tag() {
+        // offer 只提供 AEAD_AES_128_GCM（28 字节 key，RFC 7714）时回退到 GCM
+        let sdp = concat!(
+            "v=0\r\n",
+            "m=audio 4000 RTP/SAVP 0\r\n",
+            "a=crypto:1 AEAD_AES_128_GCM inline:T0iUsU5QGv2+xlg/kQvFyiymq969VLNgWOjf+w==\r\n"
+        );
+
+        let (tag, crypto) = extract_srtp_crypto_from_sdp(sdp).expect("应解析出 GCM crypto");
+        assert_eq!(tag, 1);
+        assert_eq!(crypto.suite(), SrtpSuite::AeadAes128Gcm);
+    }
+
+    #[test]
+    fn prefers_aes_cm_over_gcm_when_offer_has_both() {
+        // 常见客户端的典型 offer：tag1=GCM、tag2=AES_CM。
+        // 兼容性策略：优先选择 AES_CM_128_HMAC_SHA1_80（tag2），GCM 仅作备选。
+        let sdp = concat!(
+            "v=0\r\n",
+            "m=audio 4000 RTP/SAVP 0\r\n",
+            "a=crypto:1 AEAD_AES_128_GCM inline:T0iUsU5QGv2+xlg/kQvFyiymq969VLNgWOjf+w==\r\n",
+            "a=crypto:2 AES_CM_128_HMAC_SHA1_80 inline:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\n"
+        );
+
+        let (tag, crypto) = extract_srtp_crypto_from_sdp(sdp).expect("应解析出 crypto");
+        assert_eq!(tag, 2);
+        assert_eq!(crypto.suite(), SrtpSuite::AesCm128HmacSha180);
+    }
+
+    #[test]
+    fn extracts_aes_cm_crypto_with_offer_tag() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "m=audio 4000 RTP/SAVP 0\r\n",
+            "a=crypto:2 AES_CM_128_HMAC_SHA1_80 inline:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\n"
+        );
+
+        let (tag, crypto) = extract_srtp_crypto_from_sdp(sdp).expect("应解析出 AES_CM crypto");
+        assert_eq!(tag, 2);
+        assert_eq!(crypto.suite(), SrtpSuite::AesCm128HmacSha180);
     }
 
     #[test]

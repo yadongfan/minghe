@@ -14,9 +14,10 @@ tokio = { version = "1", features = ["full"] }
 rsip = "0.4"
 anyhow = "1"
 
-# TLS
-tokio-rustls = "0.26"
-rustls = { version = "0.23", features = ["ring"] }
+# TLS — 显式禁用默认 features，避免编译 aws-lc-rs（其 C 库 aws-lc-sys
+# 在旧版 gcc 上编译失败），只启用项目实际使用的 ring provider。
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pemfile = "2"
 rcgen = { version = "0.13", features = ["default"] }
 time = "0.3"
@@ -30,6 +31,8 @@ md-5 = "0.10"
 rand = "0.8"
 base64 = "0.22"
 hex = "0.4"
+# RFC 7714 AEAD_AES_128_GCM SRTP 套件
+aes-gcm = "0.10"
 
 # Serialization & config
 serde = { version = "1", features = ["derive"] }
