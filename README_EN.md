@@ -12,6 +12,7 @@
 - 🎵 **SRTP Media Encryption** — AES_CM_128_HMAC_SHA1_80 with SDES key exchange
 - 🔑 **SIP Digest Authentication** — MD5 digest auth with default and per-extension passwords
 - 📡 **RTP Media Relay** — Transparent server-side relay with address learning
+- 💬 **Extension Instant Messaging** — SIP MESSAGE text exchange; messages are queued while offline and auto-delivered on registration
 - 📱 **Internal Extensions** — 1000–2000 range (configurable), INVITE/BYE/CANCEL/ACK
 - 🌐 **IP Certificates** — No domain required; auto-generates IP-based TLS certificates
 - 🔄 **Auto Cert Renewal** — Self-signed certs auto-renew 30 days before expiry with hot-reload
@@ -168,6 +169,7 @@ Other clients should support SIP over TLS, SDES-SRTP (`AES_CM_128_HMAC_SHA1_80`)
 | `BYE` | End call, release media resources |
 | `CANCEL` | Cancel unanswered call |
 | `OPTIONS` | Keepalive / capability query |
+| `MESSAGE` | Extension-to-extension instant messaging; queued while offline and auto-delivered on registration |
 
 ## Project Structure
 

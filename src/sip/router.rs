@@ -12,6 +12,7 @@ use super::parser;
 use super::registrar::RegistrarService;
 use crate::media::relay::MediaRelayManager;
 use crate::media::srtp::{parse_crypto_attribute, SrtpCryptoSuite, SrtpSuite};
+use super::message::MessageService;
 
 /// 呼叫状态
 #[derive(Debug, Clone, PartialEq)]
@@ -89,8 +90,10 @@ pub struct Router {
     domain: String,
     /// 媒体地址
     media_addr: String,
-    /// 连接映射：分机号 -> 写入通道（由 server 模块更新）
-    connection_writers: RwLock<HashMap<String, mpsc::Sender<Vec<u8>>>>,
+    /// 连接映射：分机号 -> 写入通道（由 server 模块更新，与 MessageService 共享）
+    connection_writers: Arc<RwLock<HashMap<String, mpsc::Sender<Vec<u8>>>>>,
+    /// 即时消息服务（MESSAGE 在线转发与离线暂存/补投）
+    message_service: MessageService,
 }
 
 impl Router {
@@ -100,14 +103,26 @@ impl Router {
         media_manager: Arc<MediaRelayManager>,
         domain: String,
         media_addr: String,
+        range_start: u32,
+        range_end: u32,
     ) -> Self {
+        // 写入通道映射由 Router 与 MessageService 共享
+        let connection_writers = Arc::new(RwLock::new(HashMap::new()));
+        let message_service = MessageService::new(
+            Arc::clone(&registrar),
+            domain.clone(),
+            Arc::clone(&connection_writers),
+            range_start,
+            range_end,
+        );
         Self {
             active_calls: RwLock::new(HashMap::new()),
             registrar,
             media_manager,
             domain,
             media_addr,
-            connection_writers: RwLock::new(HashMap::new()),
+            connection_writers,
+            message_service,
         }
     }
 
@@ -129,6 +144,16 @@ impl Router {
     fn get_writer(&self, extension: &str) -> Option<mpsc::Sender<Vec<u8>>> {
         let writers = self.connection_writers.read().unwrap();
         writers.get(extension).cloned()
+    }
+
+    /// 处理 MESSAGE 请求（委托给 MessageService，实现在 message 模块）
+    pub async fn handle_message(&self, request_text: &str, from_ext: &str) -> Vec<u8> {
+        self.message_service.handle_message(request_text, from_ext).await
+    }
+
+    /// 补投分机的离线即时消息（委托给 MessageService，实现在 message 模块）
+    pub async fn deliver_offline_messages(&self, extension: &str) {
+        self.message_service.deliver_offline_messages(extension).await
     }
 
     /// 处理 INVITE 请求
@@ -874,11 +899,26 @@ fn build_outbound_request_bytes(
     }
 }
 
-fn build_outbound_request(
+pub(crate) fn build_outbound_request(
     request: &str,
     target_uri: &str,
     domain: &str,
     contact_uri: &str,
+) -> String {
+    build_outbound_request_with_from(request, target_uri, domain, contact_uri, "")
+}
+
+/// 带主叫身份重写的出站请求重建
+///
+/// 与 [`build_outbound_request`] 行为一致，额外在 `authenticated_from` 非空时把 From 头
+/// 重写为认证后的主叫 URI（保留原 tag 参数），防止伪造 From 冒名；为空时保留原 From 头，
+/// 以兼容 INVITE/ACK/BYE 等未启用主叫重写的路径。
+pub(crate) fn build_outbound_request_with_from(
+    request: &str,
+    target_uri: &str,
+    domain: &str,
+    contact_uri: &str,
+    authenticated_from: &str,
 ) -> String {
     let mut lines = request.lines();
     let Some(first_line) = lines.next() else {
@@ -919,6 +959,25 @@ fn build_outbound_request(
             if !contact_uri.is_empty() {
                 rewritten.push(format!("Contact: <{}>", contact_uri));
                 saw_contact = true;
+            }
+            continue;
+        }
+        if lower.starts_with("from:") || lower.starts_with("f:") {
+            if !authenticated_from.is_empty() {
+                // 重写为认证主叫，保留原 From 头的 tag 参数
+                let tag = trimmed
+                    .split(';')
+                    .skip(1)
+                    .find_map(|p| {
+                        let p = p.trim();
+                        p.starts_with("tag=").then(|| p.to_string())
+                    });
+                match tag {
+                    Some(t) => rewritten.push(format!("From: <{}>;{}", authenticated_from, t)),
+                    None => rewritten.push(format!("From: <{}>", authenticated_from)),
+                }
+            } else {
+                rewritten.push(line.to_string());
             }
             continue;
         }
@@ -1054,18 +1113,18 @@ fn reason_phrase(response: &str) -> &str {
         .unwrap_or("Unknown")
 }
 
-fn server_contact_uri(extension: &str, domain: &str) -> String {
+pub(crate) fn server_contact_uri(extension: &str, domain: &str) -> String {
     format!("sip:{}@{};transport=tls", extension, domain)
 }
 
-fn registered_contact_uri(extension: &str, domain: &str, registrar: &RegistrarService) -> String {
+pub(crate) fn registered_contact_uri(extension: &str, domain: &str, registrar: &RegistrarService) -> String {
     registrar
         .lookup(extension)
         .map(|reg| reg.contact)
         .unwrap_or_else(|| server_contact_uri(extension, domain))
 }
 
-fn extract_called_extension(request: &str) -> Option<String> {
+pub(crate) fn extract_called_extension(request: &str) -> Option<String> {
     parser::extract_request_uri(request)
         .and_then(|uri| parser::extract_extension(&uri))
         .or_else(|| {

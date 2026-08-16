@@ -5,10 +5,12 @@
 //! - `parser`: SIP 消息解析与构建
 //! - `registrar`: 注册服务与 Digest 认证
 //! - `router`: 呼叫路由（INVITE/BYE/CANCEL/ACK）
+//! - `message`: 即时消息服务（MESSAGE 在线转发与离线补投）
 //! - `transaction`: 事务管理
 
 pub mod parser;
 pub mod registrar;
 pub mod router;
+pub mod message;
 pub mod server;
 pub mod transaction;

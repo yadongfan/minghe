@@ -114,6 +114,8 @@ pub async fn run(
         Arc::clone(&media_manager),
         config.server.host.clone(),
         media_addr,
+        config.extensions.range_start,
+        config.extensions.range_end,
     ));
 
     let transaction_mgr = Arc::new(TransactionManager::new());
@@ -268,6 +270,7 @@ async fn process_sip_message(
                 let response = state.registrar.handle_register(msg_text, peer_addr);
 
                 // 检查是否注册成功（200 OK）
+                let mut pending_delivery: Option<(Arc<Router>, String)> = None;
                 if let Ok(resp_text) = std::str::from_utf8(&response) {
                     if parser::extract_status_code(resp_text) == Some(200) {
                         // 提取分机号并关联连接
@@ -281,13 +284,22 @@ async fn process_sip_message(
                                     state.set_connection_extension(&peer_addr, ext.clone());
                                     state.router.register_writer(&ext, writer_tx.clone());
                                     tracing::info!("分机 {} 已关联连接 {}", ext, peer_addr);
+                                    // 注册成功：稍后后台补投该分机的离线即时消息
+                                    pending_delivery = Some((Arc::clone(&state.router), ext));
                                 }
                             }
                         }
                     }
                 }
 
+                // 先回 200 OK，避免离线补投（最多串行发送 100 条，通道容量有限）
+                // 阻塞注册确认
                 let _ = writer_tx.send(response).await;
+                if let Some((router, ext)) = pending_delivery {
+                    tokio::spawn(async move {
+                        router.deliver_offline_messages(&ext).await;
+                    });
+                }
             }
             "INVITE" => {
                 let response = state
@@ -310,6 +322,12 @@ async fn process_sip_message(
                 let response = state.router.handle_cancel(msg_text).await;
                 let _ = writer_tx.send(response).await;
             }
+            "MESSAGE" => {
+                // 即时消息：主叫分机号取自连接认证的分机（不信任 From 头）
+                let from_ext = state.get_connection_extension(&peer_addr).unwrap_or_default();
+                let response = state.router.handle_message(msg_text, &from_ext).await;
+                let _ = writer_tx.send(response).await;
+            }
             "OPTIONS" => {
                 // 心跳 / 能力查询 — 直接回 200 OK
                 let response = parser::build_response_with_headers(
@@ -317,7 +335,7 @@ async fn process_sip_message(
                     200,
                     "OK",
                     &[
-                        ("Allow", "INVITE, ACK, BYE, CANCEL, REGISTER, OPTIONS"),
+                        ("Allow", "INVITE, ACK, BYE, CANCEL, REGISTER, OPTIONS, MESSAGE"),
                         ("Accept", "application/sdp"),
                     ],
                 );
