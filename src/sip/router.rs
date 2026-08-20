@@ -6,13 +6,14 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, RwLock};
-use tokio::sync::mpsc;
+use tokio::net::UdpSocket;
 
+use super::message::MessageService;
 use super::parser;
 use super::registrar::RegistrarService;
+use super::transport::{ConnectionSink, Transport};
 use crate::media::relay::MediaRelayManager;
 use crate::media::srtp::{parse_crypto_attribute, SrtpCryptoSuite, SrtpSuite};
-use super::message::MessageService;
 
 /// 呼叫状态
 #[derive(Debug, Clone, PartialEq)]
@@ -48,10 +49,10 @@ pub struct CallInfo {
     pub state: CallState,
     /// 主叫原始 INVITE 消息（用于构建后续响应）
     pub original_invite: String,
-    /// 主叫侧写入通道
-    pub caller_writer: mpsc::Sender<Vec<u8>>,
-    /// 被叫侧写入通道
-    pub callee_writer: Option<mpsc::Sender<Vec<u8>>>,
+    /// 主叫侧发送出口（TLS 流通道或 UDP 数据报）
+    pub caller_sink: ConnectionSink,
+    /// 被叫侧发送出口（TLS 流通道或 UDP 数据报）
+    pub callee_sink: Option<ConnectionSink>,
     /// 主叫原始 offer 中的 SRTP 密钥（用于解密主叫发来的媒体）
     pub caller_remote_crypto: Option<SrtpCryptoSuite>,
     /// 主叫原始 offer 中被选中的 crypto tag（回 answer 时必须使用相同 tag，RFC 4568）
@@ -90,8 +91,11 @@ pub struct Router {
     domain: String,
     /// 媒体地址
     media_addr: String,
-    /// 连接映射：分机号 -> 写入通道（由 server 模块更新，与 MessageService 共享）
-    connection_writers: Arc<RwLock<HashMap<String, mpsc::Sender<Vec<u8>>>>>,
+    /// 连接映射：分机号 -> 发送出口（由 server 模块更新，与 MessageService 共享；
+    /// 仅 TLS 等有持久连接的分机注册，UDP 分机由 [Router::get_outbound] 按注册表动态反查）
+    connection_writers: Arc<RwLock<HashMap<String, ConnectionSink>>>,
+    /// 明文 UDP 信令 socket（未启用明文 UDP 时为 None），用于向 UDP 分机转发信令
+    udp_socket: Option<Arc<UdpSocket>>,
     /// 即时消息服务（MESSAGE 在线转发与离线暂存/补投）
     message_service: MessageService,
 }
@@ -105,8 +109,9 @@ impl Router {
         media_addr: String,
         range_start: u32,
         range_end: u32,
+        udp_socket: Option<Arc<UdpSocket>>,
     ) -> Self {
-        // 写入通道映射由 Router 与 MessageService 共享
+        // 发送出口映射由 Router 与 MessageService 共享
         let connection_writers = Arc::new(RwLock::new(HashMap::new()));
         let message_service = MessageService::new(
             Arc::clone(&registrar),
@@ -114,6 +119,7 @@ impl Router {
             Arc::clone(&connection_writers),
             range_start,
             range_end,
+            udp_socket.clone(),
         );
         Self {
             active_calls: RwLock::new(HashMap::new()),
@@ -122,38 +128,61 @@ impl Router {
             domain,
             media_addr,
             connection_writers,
+            udp_socket,
             message_service,
         }
     }
 
-    /// 注册分机的写入通道（由 server 模块在注册成功后调用）
-    pub fn register_writer(&self, extension: &str, writer: mpsc::Sender<Vec<u8>>) {
+    /// 注册分机的发送出口（由 server 模块在 TLS 分机注册成功后调用）
+    pub fn register_writer(&self, extension: &str, sink: ConnectionSink) {
         let mut writers = self.connection_writers.write().unwrap();
-        writers.insert(extension.to_string(), writer);
-        tracing::debug!("已注册分机 {} 的写入通道", extension);
+        writers.insert(extension.to_string(), sink);
+        tracing::debug!("已注册分机 {} 的发送出口", extension);
     }
 
-    /// 注销分机的写入通道
+    /// 注销分机的发送出口
     pub fn unregister_writer(&self, extension: &str) {
         let mut writers = self.connection_writers.write().unwrap();
         writers.remove(extension);
-        tracing::debug!("已注销分机 {} 的写入通道", extension);
+        tracing::debug!("已注销分机 {} 的发送出口", extension);
     }
 
-    /// 获取分机的写入通道
-    fn get_writer(&self, extension: &str) -> Option<mpsc::Sender<Vec<u8>>> {
-        let writers = self.connection_writers.read().unwrap();
-        writers.get(extension).cloned()
+    /// 获取分机的发送出口
+    ///
+    /// 优先取已注册的持久连接出口（TLS）；未找到时若分机以明文 UDP 注册，
+    /// 则按注册表最新来源地址动态构造 UDP 出口（覆盖 NAT 重绑定后的新地址）。
+    fn get_outbound(&self, extension: &str) -> Option<ConnectionSink> {
+        if let Some(sink) = self
+            .connection_writers
+            .read()
+            .unwrap()
+            .get(extension)
+            .cloned()
+        {
+            return Some(sink);
+        }
+        if let Some(socket) = &self.udp_socket {
+            if let Some(reg) = self.registrar.lookup(extension) {
+                if reg.transport == Transport::Udp {
+                    return Some(ConnectionSink::Udp(socket.clone(), reg.transport_addr));
+                }
+            }
+        }
+        None
     }
 
     /// 处理 MESSAGE 请求（委托给 MessageService，实现在 message 模块）
     pub async fn handle_message(&self, request_text: &str, from_ext: &str) -> Vec<u8> {
-        self.message_service.handle_message(request_text, from_ext).await
+        self.message_service
+            .handle_message(request_text, from_ext)
+            .await
     }
 
     /// 补投分机的离线即时消息（委托给 MessageService，实现在 message 模块）
     pub async fn deliver_offline_messages(&self, extension: &str) {
-        self.message_service.deliver_offline_messages(extension).await
+        self.message_service
+            .deliver_offline_messages(extension)
+            .await
     }
 
     /// 处理 INVITE 请求
@@ -168,8 +197,16 @@ impl Router {
     pub async fn handle_invite(
         &self,
         request_text: &str,
-        caller_writer: mpsc::Sender<Vec<u8>>,
+        caller_sink: ConnectionSink,
+        from_addr: SocketAddr,
     ) -> Vec<u8> {
+        let ip = from_addr.ip().to_string();
+
+        // 已被 IP 封锁的来源直接拒绝，不进入任何处理（与 REGISTER 共用封锁表）
+        if self.registrar.is_blocked(&ip) {
+            return parser::build_response(request_text, 403, "Forbidden");
+        }
+
         // 提取主叫分机号
         let caller_ext = parser::extract_uri_from_header(request_text, "From")
             .and_then(|uri| parser::extract_extension(&uri))
@@ -178,6 +215,20 @@ impl Router {
         // 提取被叫分机号。多数客户端放在 Request-URI；部分客户端会把
         // Request-URI 指向服务器本身，把真实被叫放在 To 头里。
         let callee_ext = extract_called_extension(request_text).unwrap_or_default();
+
+        // 主叫身份校验：未注册的来源发起 INVITE 属于探测/扫描，直接拒绝并计入
+        // 该 IP 的失败（累计达到阈值即封锁）。合法主叫必然先完成 REGISTER 认证，
+        // 因此不会误伤正常用户。该拒绝路径打 debug，避免扫描日志刷屏。
+        if caller_ext.is_empty() || !self.registrar.is_registered(&caller_ext) {
+            tracing::debug!(
+                ip = %ip,
+                "拒绝未注册主叫 {} 的 INVITE（目标 {}），计入该 IP 失败",
+                caller_ext,
+                callee_ext
+            );
+            self.registrar.record_failure(&ip);
+            return parser::build_response(request_text, 403, "Forbidden");
+        }
 
         let call_id = parser::extract_call_id(request_text).unwrap_or_default();
         let caller_tag = parser::extract_from_tag(request_text).unwrap_or_default();
@@ -211,9 +262,9 @@ impl Router {
             return parser::build_response(request_text, 404, "Not Found");
         }
 
-        // 获取被叫的写入通道
-        let callee_writer = match self.get_writer(&callee_ext) {
-            Some(w) => w,
+        // 获取被叫的发送出口（TLS 持久连接或 UDP 数据报）
+        let callee_sink = match self.get_outbound(&callee_ext) {
+            Some(s) => s,
             None => {
                 tracing::warn!("被叫 {} 无可用连接", callee_ext);
                 return parser::build_response(request_text, 480, "Temporarily Unavailable");
@@ -266,8 +317,7 @@ impl Router {
         // 被叫侧同时提供 AES_CM_128 与 AEAD_AES_128_GCM 两种套件，供被叫选择。
         let caller_local_crypto = SrtpCryptoSuite::new_with_suite(caller_remote_crypto.suite());
         let callee_local_crypto = SrtpCryptoSuite::new(); // AES_CM_128 (tag 1)
-        let callee_local_crypto_gcm =
-            SrtpCryptoSuite::new_with_suite(SrtpSuite::AeadAes128Gcm); // AEAD_AES_128_GCM (tag 2)
+        let callee_local_crypto_gcm = SrtpCryptoSuite::new_with_suite(SrtpSuite::AeadAes128Gcm); // AEAD_AES_128_GCM (tag 2)
 
         // 修改 SDP：替换媒体地址和端口，并强制声明 RTP/SAVP + SDES crypto
         let callee_cryptos = vec![
@@ -301,7 +351,8 @@ impl Router {
             &rebuilt,
             &target_uri,
             &self.domain,
-            &server_contact_uri(&caller_ext, &self.domain),
+            &server_contact_uri(&caller_ext, &self.domain, callee_sink.transport()),
+            callee_sink.transport(),
         );
 
         // 存储呼叫信息
@@ -315,8 +366,8 @@ impl Router {
             callee_remote_contact: None,
             state: CallState::Trying,
             original_invite: request_text.to_string(),
-            caller_writer: caller_writer.clone(),
-            callee_writer: Some(callee_writer.clone()),
+            caller_sink: caller_sink.clone(),
+            callee_sink: Some(callee_sink.clone()),
             caller_remote_crypto: Some(caller_remote_crypto),
             caller_remote_crypto_tag,
             caller_local_crypto: Some(caller_local_crypto),
@@ -336,7 +387,7 @@ impl Router {
         }
 
         // 转发 INVITE 到被叫
-        if let Err(e) = callee_writer.send(callee_invite).await {
+        if let Err(e) = callee_sink.send(callee_invite).await {
             tracing::error!("无法转发 INVITE 到被叫 {}: {}", callee_ext, e);
             self.cleanup_call(&call_id);
             return parser::build_response(request_text, 500, "Internal Server Error");
@@ -364,7 +415,7 @@ impl Router {
             None => return,
         };
 
-        let caller_writer;
+        let caller_sink;
         let caller_relay_port;
         let media_addr;
         let original_invite;
@@ -431,7 +482,7 @@ impl Router {
                 _ => {}
             }
 
-            caller_writer = call.caller_writer.clone();
+            caller_sink = call.caller_sink.clone();
             caller_relay_port = call.caller_relay_port;
             media_addr = self.media_addr.clone();
             original_invite = call.original_invite.clone();
@@ -441,7 +492,7 @@ impl Router {
 
         if missing_required_srtp {
             let response = parser::build_response(&original_invite, 488, "Not Acceptable Here");
-            if let Err(e) = caller_writer.send(response).await {
+            if let Err(e) = caller_sink.send(response).await {
                 tracing::error!("无法向主叫发送 SRTP 强制失败响应: {}", e);
             }
             self.cleanup_call(&call_id);
@@ -451,6 +502,13 @@ impl Router {
         // 用原始 INVITE 的头部重建响应给主叫
         // 这样 Via、From、To、CSeq、Call-ID 都和主叫的原始请求匹配
         let forwarded_response = if let Some(body) = parser::extract_body(response_text) {
+            // 有 SDP body — 修改媒体地址和端口，并强制写回 SRTP 参数
+            tracing::debug!(
+                "被叫 {} 原始 answer SDP (Call-ID={}):\n{}",
+                callee_ext,
+                call_id,
+                body
+            );
             // 有 SDP body — 修改媒体地址和端口，并强制写回 SRTP 参数
             let caller_crypto = match {
                 let calls = self.active_calls.read().unwrap();
@@ -468,7 +526,7 @@ impl Router {
                     );
                     let response =
                         parser::build_response(&original_invite, 500, "Internal Server Error");
-                    if let Err(e) = caller_writer.send(response).await {
+                    if let Err(e) = caller_sink.send(response).await {
                         tracing::error!("无法向主叫发送内部错误响应: {}", e);
                     }
                     self.cleanup_call(&call_id);
@@ -502,6 +560,17 @@ impl Router {
             // 主叫侧判定 answer 不兼容而挂断。这里在末尾补一行无副作用的
             // 媒体属性（a=ptime），使 crypto 不再位于最后一行。
             let new_sdp = ensure_answer_crypto_not_last_line(&new_sdp);
+            // 补全 SDP 中缺失的 a=rtpmap 映射：部分老终端在 answer 中回声了
+            // offer 中的 payload type 但未提供对应的 a=rtpmap 行（如 102、101 等
+            // 动态 payload type），严格客户端（MicroSIP/Bria 的 PJSIP 栈）会因
+            // 找不到映射而拒绝 SDP 协商。这里补 `unknown/8000` 占位使解析通过。
+            let new_sdp = fill_missing_rtpmap(&new_sdp);
+            tracing::debug!(
+                "转发给主叫 {} 的 answer SDP (Call-ID={}):\n{}",
+                callee_ext,
+                call_id,
+                new_sdp
+            );
             // 使用原始 INVITE 头部构建带 SDP 的响应
             let reason = match status_code {
                 100 => "Trying",
@@ -515,7 +584,7 @@ impl Router {
                 response_text,
                 status_code,
                 reason,
-                &server_contact_uri(&callee_ext, &self.domain),
+                &server_contact_uri(&callee_ext, &self.domain, caller_sink.transport()),
                 &new_sdp,
             )
         } else {
@@ -536,13 +605,13 @@ impl Router {
                 response_text,
                 status_code,
                 reason,
-                &server_contact_uri(&callee_ext, &self.domain),
+                &server_contact_uri(&callee_ext, &self.domain, caller_sink.transport()),
                 "",
             )
         };
 
         // 转发给主叫
-        if let Err(e) = caller_writer.send(forwarded_response).await {
+        if let Err(e) = caller_sink.send(forwarded_response).await {
             tracing::error!("无法转发响应到主叫: {}", e);
         }
 
@@ -589,11 +658,11 @@ impl Router {
             None => return,
         };
 
-        let (callee_writer, target_uri) = {
+        let (callee_sink, target_uri) = {
             let calls = self.active_calls.read().unwrap();
             match calls.get(&call_id) {
                 Some(call) => (
-                    call.callee_writer.clone(),
+                    call.callee_sink.clone(),
                     call.callee_remote_contact.clone().unwrap_or_else(|| {
                         registered_contact_uri(&call.callee_ext, &self.domain, &self.registrar)
                     }),
@@ -606,9 +675,15 @@ impl Router {
         };
 
         // 转发 ACK 到被叫
-        if let Some(writer) = callee_writer {
-            let forwarded_ack = build_outbound_request(request_text, &target_uri, &self.domain, "");
-            if let Err(e) = writer.send(forwarded_ack.into_bytes()).await {
+        if let Some(sink) = callee_sink {
+            let forwarded_ack = build_outbound_request(
+                request_text,
+                &target_uri,
+                &self.domain,
+                "",
+                sink.transport(),
+            );
+            if let Err(e) = sink.send(forwarded_ack.into_bytes()).await {
                 tracing::error!("无法转发 ACK: {}", e);
             } else {
                 tracing::debug!("ACK 已转发 (Call-ID: {})", call_id);
@@ -629,8 +704,15 @@ impl Router {
             }
         };
 
-        let other_writer;
+        // BYE 方向识别：优先使用对话级 From tag（UDP 设备也携带），
+        // 连接层 from_extension 仅作后备——UDP 设备经 NAT 重绑定后
+        // 来源端口可能变化，连接层识别会失败（from_extension 为空）。
+        let bye_from_tag = parser::extract_from_tag(request_text).unwrap_or_default();
+
+        let other_sink;
         let target_uri;
+        let bye_from_caller;
+        let bye_from_callee;
 
         {
             let calls = self.active_calls.read().unwrap();
@@ -646,16 +728,30 @@ impl Router {
                 }
             };
 
-            // 确定对端的写入通道
-            if from_extension == call.caller_ext {
-                other_writer = call.callee_writer.clone();
+            // 主叫 From tag 与消息 From tag 一致 → BYE 由主叫发出；
+            // 被叫 tag（200 OK 的 To tag）与消息 From tag 一致 → BYE 由被叫发出。
+            bye_from_caller = !bye_from_tag.is_empty() && bye_from_tag == call.caller_tag;
+            bye_from_callee = !bye_from_tag.is_empty()
+                && call.callee_tag.as_deref() == Some(bye_from_tag.as_str());
+
+            // 确定对端的发送出口
+            if bye_from_caller {
+                other_sink = call.callee_sink.clone();
                 target_uri = call.callee_remote_contact.clone().unwrap_or_else(|| {
                     registered_contact_uri(&call.callee_ext, &self.domain, &self.registrar)
                 });
-            } else {
-                other_writer = Some(call.caller_writer.clone());
+            } else if bye_from_callee || from_extension != call.caller_ext {
+                // 由被叫发出（或无法按 tag 识别时，按旧逻辑默认视为被叫侧）
+                other_sink = Some(call.caller_sink.clone());
                 target_uri = call.caller_remote_contact.clone().unwrap_or_else(|| {
                     registered_contact_uri(&call.caller_ext, &self.domain, &self.registrar)
+                });
+            } else {
+                // from_extension 明确为主叫但 tag 无法匹配（异常呼叫/早媒体）：
+                // 仍视为主叫挂断，转发给被叫
+                other_sink = call.callee_sink.clone();
+                target_uri = call.callee_remote_contact.clone().unwrap_or_else(|| {
+                    registered_contact_uri(&call.callee_ext, &self.domain, &self.registrar)
                 });
             }
         }
@@ -670,19 +766,38 @@ impl Router {
             .unwrap_or_else(|| "无".to_string());
 
         tracing::info!(
-            "收到 BYE: 来自 {} (Call-ID: {}, Reason: {}, User-Agent: {}, Session-Expires: {})",
+            "收到 BYE: 来自 {} (Call-ID: {}, FromTag: {}, 方向: {}, Reason: {}, User-Agent: {}, Session-Expires: {})",
             from_extension,
             call_id,
+            bye_from_tag,
+            if bye_from_caller {
+                "主叫挂断"
+            } else if bye_from_callee {
+                "被叫挂断"
+            } else {
+                "未识别"
+            },
             reason,
             user_agent,
             session_expires
         );
 
         // 转发 BYE 到对端
-        if let Some(writer) = other_writer {
-            let forwarded_bye = build_outbound_request(request_text, &target_uri, &self.domain, "");
-            if let Err(e) = writer.send(forwarded_bye.into_bytes()).await {
-                tracing::error!("无法转发 BYE: {}", e);
+        if let Some(sink) = other_sink {
+            let forwarded_bye = build_outbound_request(
+                request_text,
+                &target_uri,
+                &self.domain,
+                "",
+                sink.transport(),
+            );
+            match sink.send(forwarded_bye.into_bytes()).await {
+                Ok(_) => tracing::debug!(
+                    "BYE 已转发到对端 {} (Call-ID: {})",
+                    target_uri,
+                    call_id
+                ),
+                Err(e) => tracing::error!("无法转发 BYE 到 {}: {}", target_uri, e),
             }
         }
 
@@ -706,7 +821,7 @@ impl Router {
             }
         };
 
-        let callee_writer;
+        let callee_sink;
         let target_uri;
         let original_invite;
 
@@ -724,7 +839,7 @@ impl Router {
             };
 
             call.state = CallState::Terminated;
-            callee_writer = call.callee_writer.clone();
+            callee_sink = call.callee_sink.clone();
             target_uri = call.callee_remote_contact.clone().unwrap_or_else(|| {
                 registered_contact_uri(&call.callee_ext, &self.domain, &self.registrar)
             });
@@ -734,21 +849,26 @@ impl Router {
         tracing::info!("收到 CANCEL (Call-ID: {})", call_id);
 
         // 转发 CANCEL 到被叫
-        if let Some(writer) = callee_writer {
-            let forwarded_cancel =
-                build_outbound_request(request_text, &target_uri, &self.domain, "");
-            if let Err(e) = writer.send(forwarded_cancel.into_bytes()).await {
+        if let Some(sink) = callee_sink {
+            let forwarded_cancel = build_outbound_request(
+                request_text,
+                &target_uri,
+                &self.domain,
+                "",
+                sink.transport(),
+            );
+            if let Err(e) = sink.send(forwarded_cancel.into_bytes()).await {
                 tracing::error!("无法转发 CANCEL: {}", e);
             }
 
             // 发送 487 Request Terminated 给主叫
             let terminated = parser::build_response(&original_invite, 487, "Request Terminated");
-            let caller_writer = {
+            let caller_sink = {
                 let calls = self.active_calls.read().unwrap();
-                calls.get(&call_id).map(|c| c.caller_writer.clone())
+                calls.get(&call_id).map(|c| c.caller_sink.clone())
             };
-            if let Some(writer) = caller_writer {
-                let _ = writer.send(terminated).await;
+            if let Some(sink) = caller_sink {
+                let _ = sink.send(terminated).await;
             }
         }
 
@@ -797,7 +917,8 @@ impl Router {
             let call_id_clone = call_id.to_string();
             let caller_decrypt_crypto = call.caller_remote_crypto.clone();
             // 根据被叫 answer 中选定的套件，选择对应的本地加密套件（被叫选 GCM 时使用 GCM 实例）
-            let callee_encrypt_crypto = match call.callee_remote_crypto.as_ref().map(|c| c.suite()) {
+            let callee_encrypt_crypto = match call.callee_remote_crypto.as_ref().map(|c| c.suite())
+            {
                 Some(SrtpSuite::AeadAes128Gcm) => call
                     .callee_local_crypto_gcm
                     .clone()
@@ -892,9 +1013,12 @@ fn build_outbound_request_bytes(
     target_uri: &str,
     domain: &str,
     contact_uri: &str,
+    transport: Transport,
 ) -> Vec<u8> {
     match std::str::from_utf8(request) {
-        Ok(text) => build_outbound_request(text, target_uri, domain, contact_uri).into_bytes(),
+        Ok(text) => {
+            build_outbound_request(text, target_uri, domain, contact_uri, transport).into_bytes()
+        }
         Err(_) => request.to_vec(),
     }
 }
@@ -904,8 +1028,9 @@ pub(crate) fn build_outbound_request(
     target_uri: &str,
     domain: &str,
     contact_uri: &str,
+    transport: Transport,
 ) -> String {
-    build_outbound_request_with_from(request, target_uri, domain, contact_uri, "")
+    build_outbound_request_with_from(request, target_uri, domain, contact_uri, "", transport)
 }
 
 /// 带主叫身份重写的出站请求重建
@@ -913,12 +1038,14 @@ pub(crate) fn build_outbound_request(
 /// 与 [`build_outbound_request`] 行为一致，额外在 `authenticated_from` 非空时把 From 头
 /// 重写为认证后的主叫 URI（保留原 tag 参数），防止伪造 From 冒名；为空时保留原 From 头，
 /// 以兼容 INVITE/ACK/BYE 等未启用主叫重写的路径。
+/// `transport` 指出站传输类型，决定生成的 Via 头协议标识（如 `SIP/2.0/UDP`）。
 pub(crate) fn build_outbound_request_with_from(
     request: &str,
     target_uri: &str,
     domain: &str,
     contact_uri: &str,
     authenticated_from: &str,
+    transport: Transport,
 ) -> String {
     let mut lines = request.lines();
     let Some(first_line) = lines.next() else {
@@ -934,7 +1061,8 @@ pub(crate) fn build_outbound_request_with_from(
     let mut saw_contact = false;
     rewritten.push(format!("{} {} {}", parts[0], target_uri, parts[2]));
     rewritten.push(format!(
-        "Via: SIP/2.0/TLS {};branch={}",
+        "Via: SIP/2.0/{} {};branch={}",
+        transport.via_token(),
         domain,
         parser::generate_branch()
     ));
@@ -965,13 +1093,10 @@ pub(crate) fn build_outbound_request_with_from(
         if lower.starts_with("from:") || lower.starts_with("f:") {
             if !authenticated_from.is_empty() {
                 // 重写为认证主叫，保留原 From 头的 tag 参数
-                let tag = trimmed
-                    .split(';')
-                    .skip(1)
-                    .find_map(|p| {
-                        let p = p.trim();
-                        p.starts_with("tag=").then(|| p.to_string())
-                    });
+                let tag = trimmed.split(';').skip(1).find_map(|p| {
+                    let p = p.trim();
+                    p.starts_with("tag=").then(|| p.to_string())
+                });
                 match tag {
                     Some(t) => rewritten.push(format!("From: <{}>;{}", authenticated_from, t)),
                     None => rewritten.push(format!("From: <{}>", authenticated_from)),
@@ -1113,15 +1238,24 @@ fn reason_phrase(response: &str) -> &str {
         .unwrap_or("Unknown")
 }
 
-pub(crate) fn server_contact_uri(extension: &str, domain: &str) -> String {
-    format!("sip:{}@{};transport=tls", extension, domain)
+pub(crate) fn server_contact_uri(extension: &str, domain: &str, transport: Transport) -> String {
+    format!(
+        "sip:{}@{};transport={}",
+        extension,
+        domain,
+        transport.uri_param()
+    )
 }
 
-pub(crate) fn registered_contact_uri(extension: &str, domain: &str, registrar: &RegistrarService) -> String {
+pub(crate) fn registered_contact_uri(
+    extension: &str,
+    domain: &str,
+    registrar: &RegistrarService,
+) -> String {
     registrar
         .lookup(extension)
         .map(|reg| reg.contact)
-        .unwrap_or_else(|| server_contact_uri(extension, domain))
+        .unwrap_or_else(|| server_contact_uri(extension, domain, Transport::Tls))
 }
 
 pub(crate) fn extract_called_extension(request: &str) -> Option<String> {
@@ -1144,14 +1278,76 @@ pub(crate) fn extract_called_extension(request: &str) -> Option<String> {
 /// 时长建议（20ms 为常见默认），无端口等副作用，且主流客户端的 answer 中通常
 /// 不包含该行，不会造成重复。
 fn ensure_answer_crypto_not_last_line(sdp: &str) -> String {
-    let has_ptime = sdp
-        .lines()
-        .any(|l| l.trim_start().to_ascii_lowercase().starts_with("a=ptime"));
-    if has_ptime {
+    // 检查最后一行是否为 crypto 行
+    let trimmed = sdp.trim_end_matches('\n').trim_end_matches('\r');
+    let last_line = trimmed.rsplit('\n').next().unwrap_or("");
+    let last_is_crypto = last_line
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("a=crypto:");
+    if !last_is_crypto {
         return sdp.to_string();
     }
-    let trimmed = sdp.trim_end_matches('\n').trim_end_matches('\r');
+    // crypto 是最后一行：追加 a=ptime:20。
+    // 即使已有 a=ptime 行也追加——解析器取最后值，20ms 是常见默认，不会改变语义。
     format!("{}\r\na=ptime:20\r\n", trimmed)
+}
+
+/// 补全 SDP 中缺失的 `a=rtpmap` 映射
+///
+/// 部分老终端在 answer 中回声了 offer 中的 payload type 但未提供对应的
+/// `a=rtpmap` 行（如 DTMF 101 或自定义 codec 102 等动态 payload type），
+/// 严格客户端（MicroSIP/Bria 的 PJSIP 栈）会因找不到映射而拒绝 SDP 协商。
+/// 这里对无映射的动态 payload type（>95）补一行 `unknown/8000` 占位，
+/// 使解析器能通过，实际通话中不会使用该 codec。
+fn fill_missing_rtpmap(sdp: &str) -> String {
+    let mut in_audio = false;
+    let mut audio_pts: Vec<u16> = Vec::new();
+    let mut rtpmap_pts: std::collections::HashSet<u16> = std::collections::HashSet::new();
+
+    for line in sdp.lines() {
+        if line.starts_with("m=") {
+            in_audio = line.starts_with("m=audio");
+        }
+        if in_audio {
+            if let Some(rest) = line.trim().strip_prefix("a=rtpmap:") {
+                if let Some(pt) = rest.split_whitespace().next() {
+                    if let Ok(num) = pt.parse::<u16>() {
+                        rtpmap_pts.insert(num);
+                    }
+                }
+            }
+        }
+        if in_audio && line.starts_with("m=audio") {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 4 {
+                for pt_str in &parts[3..] {
+                    if let Ok(num) = pt_str.parse::<u16>() {
+                        audio_pts.push(num);
+                    }
+                }
+            }
+        }
+    }
+
+    let missing: Vec<u16> = audio_pts
+        .into_iter()
+        .filter(|pt| *pt > 95 && !rtpmap_pts.contains(pt))
+        .collect();
+
+    if missing.is_empty() {
+        return sdp.to_string();
+    }
+
+    let mut result = sdp
+        .trim_end_matches('\n')
+        .trim_end_matches('\r')
+        .to_string();
+    for pt in &missing {
+        result.push_str(&format!("\r\na=rtpmap:{} unknown/8000", pt));
+    }
+    result.push_str("\r\n");
+    result
 }
 
 /// 从 SDP 中提取首个受支持的 SRTP crypto（tag, 密钥）
@@ -1296,6 +1492,7 @@ mod tests {
             "sip:1002@callee-device.invalid;transport=tls",
             "example.com",
             "sip:1001@example.com;transport=tls",
+            Transport::Tls,
         );
 
         assert!(rewritten
@@ -1328,6 +1525,7 @@ mod tests {
             "sip:1002@callee-device.invalid;transport=tls",
             "example.com",
             "sip:1001@example.com;transport=tls",
+            Transport::Tls,
         );
 
         assert!(rewritten.contains("Supported: outbound, replaces\r\n"));
@@ -1358,6 +1556,7 @@ mod tests {
             "sip:1002@callee-device.invalid;transport=tls",
             "example.com",
             "sip:1001@example.com;transport=tls",
+            Transport::Tls,
         );
 
         assert!(rewritten.contains("Supported: replaces, outbound\r\n"));
@@ -1384,6 +1583,7 @@ mod tests {
             "sip:1002@callee-device.invalid;transport=tls",
             "example.com",
             "sip:1001@example.com;transport=tls",
+            Transport::Tls,
         );
 
         assert!(rewritten.contains("k: replaces\r\n"));
@@ -1423,6 +1623,7 @@ mod tests {
             "sip:1002@callee-device.invalid;transport=tls",
             "example.com",
             "sip:1001@example.com;transport=tls",
+            Transport::Tls,
         );
 
         assert!(rewritten
@@ -1477,6 +1678,7 @@ mod tests {
             "sip:1002@callee-device.invalid;transport=tls",
             "example.com",
             "",
+            Transport::Tls,
         );
 
         assert!(
@@ -1538,7 +1740,8 @@ mod tests {
             "a=rtcp-xr:rcvr-rtt=all:10000 stat-summary=loss,dup,jitt,TTL voip-metrics\r\n",
             "a=record:off\r\n",
             "m=audio 20016 RTP/SAVP 0 8 101\r\n",
-            "a=rtpmap:101 telephone-event/8000\r\n",
+"a=rtpmap:101 telephone-event/8000\r\n",
+"a=rtpmap:101 telephone-event/8000\r\n",
             "a=rtcp-fb:* trr-int 1000\r\n",
             "a=rtcp-fb:* ccm tmmbr\r\n",
             "a=crypto:2 AES_CM_128_HMAC_SHA1_80 inline:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\n"
@@ -1640,5 +1843,266 @@ mod tests {
             extract_audio_media_addr_from_sdp(sdp),
             Some("192.168.1.20:4000".parse().unwrap())
         );
+    }
+
+    #[test]
+    fn outbound_request_uses_udp_via_and_contact() {
+        let invite = concat!(
+            "INVITE sip:1002@example.com SIP/2.0\r\n",
+            "Via: SIP/2.0/TLS caller.example.com;branch=z9hG4bKcaller\r\n",
+            "From: <sips:1001@example.com>;tag=caller-tag\r\n",
+            "To: <sips:1002@example.com>\r\n",
+            "Call-ID: call-udp\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Content-Length: 0\r\n\r\n"
+        );
+
+        let rewritten = build_outbound_request(
+            invite,
+            "sip:1002@callee-device.invalid;transport=udp",
+            "example.com",
+            "sip:1001@example.com;transport=udp",
+            Transport::Udp,
+        );
+
+        // UDP 出站请求必须使用 UDP Via 协议标识，Contact 携带 transport=udp
+        assert!(rewritten
+            .starts_with("INVITE sip:1002@callee-device.invalid;transport=udp SIP/2.0\r\n"));
+        assert!(rewritten.contains("Via: SIP/2.0/UDP example.com;branch=z9hG4bK"));
+        assert!(rewritten.contains("Contact: <sip:1001@example.com;transport=udp>\r\n"));
+    }
+
+    #[test]
+    fn server_contact_uri_reflects_transport() {
+        assert_eq!(
+            server_contact_uri("1001", "example.com", Transport::Tls),
+            "sip:1001@example.com;transport=tls"
+        );
+        assert_eq!(
+            server_contact_uri("1001", "example.com", Transport::Udp),
+            "sip:1001@example.com;transport=udp"
+        );
+    }
+
+    /// 构造带内存通道出口的测试 Router，返回 (router, caller_tx, caller_rx, callee_tx, callee_rx)
+    fn test_router_with_sinks() -> (
+        Router,
+        tokio::sync::mpsc::Sender<Vec<u8>>,
+        tokio::sync::mpsc::Receiver<Vec<u8>>,
+        tokio::sync::mpsc::Sender<Vec<u8>>,
+        tokio::sync::mpsc::Receiver<Vec<u8>>,
+    ) {
+        let registrar = Arc::new(RegistrarService::new(
+            "example.com".to_string(),
+            "secret".to_string(),
+            HashMap::new(),
+            1000,
+            1999,
+            vec![],
+        ));
+        let media = Arc::new(MediaRelayManager::new(
+            41000,
+            41999,
+            "127.0.0.1".to_string(),
+        ));
+        let router = Router::new(
+            Arc::clone(&registrar),
+            media,
+            "example.com".to_string(),
+            "127.0.0.1".to_string(),
+            1000,
+            1999,
+            None,
+        );
+        let (caller_tx, caller_rx) = tokio::sync::mpsc::channel(8);
+        let (callee_tx, callee_rx) = tokio::sync::mpsc::channel(8);
+        (router, caller_tx, caller_rx, callee_tx, callee_rx)
+    }
+
+    /// 直接向 active_calls 写入一个已建立（Established）的呼叫
+    fn insert_established_call(
+        router: &Router,
+        call_id: &str,
+        caller_ext: &str,
+        caller_tag: &str,
+        callee_ext: &str,
+        callee_tag: &str,
+        caller_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+        callee_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    ) {
+        let call = CallInfo {
+            call_id: call_id.to_string(),
+            caller_ext: caller_ext.to_string(),
+            callee_ext: callee_ext.to_string(),
+            caller_tag: caller_tag.to_string(),
+            callee_tag: Some(callee_tag.to_string()),
+            caller_remote_contact: Some(format!("sip:{}@caller-device.invalid", caller_ext)),
+            callee_remote_contact: Some(format!("sip:{}@callee-device.invalid", callee_ext)),
+            state: CallState::Established,
+            original_invite: String::new(),
+            caller_sink: ConnectionSink::Stream(caller_tx),
+            callee_sink: Some(ConnectionSink::Stream(callee_tx)),
+            caller_remote_crypto: None,
+            caller_remote_crypto_tag: 1,
+            caller_local_crypto: None,
+            callee_remote_crypto: None,
+            callee_local_crypto: None,
+            callee_local_crypto_gcm: None,
+            caller_media_addr: None,
+            callee_media_addr: None,
+            caller_relay_port: 0,
+            callee_relay_port: 0,
+            relay_started: true,
+        };
+        router.active_calls.write().unwrap().insert(call_id.to_string(), call);
+    }
+
+    #[tokio::test]
+    async fn bye_from_udp_callee_with_empty_from_extension_forwards_to_caller() {
+        let (router, _caller_tx, mut caller_rx, callee_tx, _callee_rx) = test_router_with_sinks();
+        insert_established_call(
+            &router,
+            "call-bye-1",
+            "1001",
+            "caller-tag",
+            "1002",
+            "callee-tag",
+            _caller_tx,
+            callee_tx,
+        );
+
+        // 被叫（UDP 老设备）挂断。模拟 NAT 重绑定后来源地址无法识别
+        // → from_extension 为空；方向必须由 BYE 的 From tag（callee-tag）识别。
+        let bye = concat!(
+            "BYE sip:1001@example.com SIP/2.0\r\n",
+            "Via: SIP/2.0/UDP 36.148.81.8:1809;branch=z9hG4bKbye1\r\n",
+            "From: <sip:1002@example.com>;tag=callee-tag\r\n",
+            "To: <sip:1001@example.com>;tag=caller-tag\r\n",
+            "Call-ID: call-bye-1\r\n",
+            "CSeq: 2 BYE\r\n",
+            "Content-Length: 0\r\n\r\n"
+        );
+        let response = router.handle_bye(bye, "").await;
+        assert!(
+            String::from_utf8_lossy(&response).contains("200 OK"),
+            "BYE 应回 200 OK"
+        );
+
+        // 主叫必须收到转发的 BYE
+        let delivered = caller_rx
+            .try_recv()
+            .expect("主叫应收到被叫挂断的 BYE");
+        let text = String::from_utf8(delivered).unwrap();
+        assert!(text.starts_with("BYE "));
+        assert!(text.contains("Call-ID: call-bye-1"));
+    }
+
+    #[tokio::test]
+    async fn bye_from_caller_with_empty_from_extension_forwards_to_callee() {
+        let (router, caller_tx, _caller_rx, _callee_tx, mut callee_rx) = test_router_with_sinks();
+        insert_established_call(
+            &router,
+            "call-bye-2",
+            "1001",
+            "caller-tag",
+            "1002",
+            "callee-tag",
+            caller_tx,
+            _callee_tx,
+        );
+
+        // 主叫挂断，from_extension 同样为空（识别失败场景）；
+        // 由 From tag（caller-tag）识别为主叫挂断，必须转发给被叫而非转发回主叫。
+        let bye = concat!(
+            "BYE sip:1002@example.com SIP/2.0\r\n",
+            "Via: SIP/2.0/TLS caller.example.com;branch=z9hG4bKbye2\r\n",
+            "From: <sip:1001@example.com>;tag=caller-tag\r\n",
+            "To: <sip:1002@example.com>;tag=callee-tag\r\n",
+            "Call-ID: call-bye-2\r\n",
+            "CSeq: 2 BYE\r\n",
+            "Content-Length: 0\r\n\r\n"
+        );
+        let response = router.handle_bye(bye, "").await;
+        assert!(
+            String::from_utf8_lossy(&response).contains("200 OK"),
+            "BYE 应回 200 OK"
+        );
+
+        // 被叫必须收到转发的 BYE
+        let delivered = callee_rx
+            .try_recv()
+            .expect("被叫应收到主叫挂断的 BYE");
+        let text = String::from_utf8(delivered).unwrap();
+        assert!(text.starts_with("BYE "));
+        assert!(text.contains("Call-ID: call-bye-2"));
+    }
+
+    #[tokio::test]
+    async fn invite_from_unregistered_extension_is_rejected_and_counts_failure() {
+        let (router, caller_tx, _caller_rx, _callee_tx, _callee_rx) = test_router_with_sinks();
+        let sink = ConnectionSink::Stream(caller_tx);
+        let from: SocketAddr = "203.0.113.50:5061".parse().unwrap();
+
+        let invite = concat!(
+            "INVITE sip:0048422032120@example.com SIP/2.0\r\n",
+            "Via: SIP/2.0/TLS scan.example.com;branch=z9hG4bKinv1\r\n",
+            "From: <sip:5@example.com>;tag=tag1\r\n",
+            "To: <sip:0048422032120@example.com>\r\n",
+            "Call-ID: cid-scan\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Content-Length: 0\r\n\r\n"
+        );
+
+        // 未注册主叫的 INVITE（攻击者探测）应被拒绝 403，且每次计入该 IP 失败
+        for _ in 0..3 {
+            let resp = router.handle_invite(&invite, sink.clone(), from).await;
+            assert_eq!(
+                parser::extract_status_code(&String::from_utf8(resp).unwrap()),
+                Some(403)
+            );
+        }
+
+        // 累计 3 次失败后该 IP 被永久封锁
+        assert!(router.registrar.is_blocked("203.0.113.50"));
+
+        // 封锁后再次 INVITE 仍被直接拒绝
+        let resp = router.handle_invite(&invite, sink.clone(), from).await;
+        assert_eq!(
+            parser::extract_status_code(&String::from_utf8(resp).unwrap()),
+            Some(403)
+        );
+    }
+
+    #[tokio::test]
+    async fn invite_from_registered_extension_is_not_rejected_by_auth_guard() {
+        let (router, caller_tx, _caller_rx, _callee_tx, _callee_rx) = test_router_with_sinks();
+        let sink = ConnectionSink::Stream(caller_tx);
+        let from: SocketAddr = "127.0.0.1:5061".parse().unwrap();
+
+        // 模拟 1001 已注册（合法主叫）
+        router
+            .registrar
+            .register(crate::sip::registrar::Registration {
+                extension: "1001".to_string(),
+                contact: "<sip:1001@client.invalid>".to_string(),
+                expires_at: u64::MAX,
+                transport_addr: "127.0.0.1:5061".parse().unwrap(),
+                transport: Transport::Tls,
+            });
+
+        let invite = concat!(
+            "INVITE sip:1002@example.com SIP/2.0\r\n",
+            "Via: SIP/2.0/TLS client.example.com;branch=z9hG4bKinv2\r\n",
+            "From: <sip:1001@example.com>;tag=tag2\r\n",
+            "To: <sip:1002@example.com>\r\n",
+            "Call-ID: cid-ok\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Content-Length: 0\r\n\r\n"
+        );
+
+        let resp = router.handle_invite(&invite, sink, from).await;
+        let code = parser::extract_status_code(&String::from_utf8(resp).unwrap());
+        // 合法主叫不应被 403 拦截；被叫 1002 未注册 → 应返回 404
+        assert_eq!(code, Some(404));
     }
 }

@@ -26,6 +26,9 @@ services:
     ports:
       # SIP TLS 信令端口
       - "${SIP_PORT:-5061}:5061/tcp"
+      # 明文 UDP 信令端口（可选）：仅当 config.toml 中 insecure_enabled = true 时需要；
+      # 常规纯 TLS 部署无需映射此端口。
+      - "${INSECURE_SIP_PORT:-5060}:${INSECURE_SIP_PORT:-5060}/udp"
       # RTP/SRTP 媒体端口范围（UDP）
       # 外部端口必须与容器端口一致，因为 SDP 会直接公布这些端口。
       # 默认 20000-20020 支持约 10 通并发；不要在小 VPS 上一次映射上万个 UDP 端口。

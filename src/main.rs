@@ -89,10 +89,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.passwords.clone(),
         config.extensions.range_start,
         config.extensions.range_end,
+        config.server.insecure_extensions.clone(),
     ));
 
     // 启动注册清理后台任务
     registrar.start_cleanup_task();
+
+    // 明文 UDP 信令：创建共享 UDP socket（仅白名单分机可用）
+    let udp_socket: Option<std::sync::Arc<tokio::net::UdpSocket>> =
+        if config.server.insecure_enabled {
+            let udp_addr = format!(
+                "{}:{}",
+                config.server.listen_addr, config.server.insecure_port
+            );
+            match tokio::net::UdpSocket::bind(&udp_addr).await {
+                Ok(sock) => {
+                    tracing::info!("明文 UDP 信令已监听 {}", udp_addr);
+                    Some(std::sync::Arc::new(sock))
+                }
+                Err(e) => {
+                    tracing::error!("无法绑定明文 UDP 端口 {}: {}", udp_addr, e);
+                    return Err(e.into());
+                }
+            }
+        } else {
+            None
+        };
 
     // 创建媒体中继管理器
     let media_manager = Arc::new(media::relay::MediaRelayManager::new(
@@ -113,9 +135,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let registrar = Arc::clone(&registrar);
         let media_manager = Arc::clone(&media_manager);
         let tls_acceptor = tls_acceptor.clone();
+        let udp_socket = udp_socket.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = sip::server::run(config, tls_acceptor, registrar, media_manager).await {
+            if let Err(e) =
+                sip::server::run(config, tls_acceptor, registrar, media_manager, udp_socket).await
+            {
                 tracing::error!("SIP 服务器运行错误: {}", e);
             }
         })
