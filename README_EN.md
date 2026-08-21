@@ -9,9 +9,10 @@
 ## Features
 
 - 🔒 **TLS Signaling Encryption** — SIP over TLS (SIPS) on port 5061, TLS 1.2/1.3
-- 🎵 **SRTP Media Encryption** — AES_CM_128_HMAC_SHA1_80 with SDES key exchange
+- 🎵 **SRTP Media Encryption** — AES_CM_128_HMAC_SHA1_80 / AEAD_AES_128_GCM (RFC 7714) with SDES key exchange
 - 🔑 **SIP Digest Authentication** — MD5 digest auth with default and per-extension passwords
 - 📡 **RTP Media Relay** — Transparent server-side relay with address learning
+- 💬 **Extension Instant Messaging** — SIP MESSAGE text exchange; messages are queued while offline and auto-delivered on registration
 - 📱 **Internal Extensions** — 1000–2000 range (configurable), INVITE/BYE/CANCEL/ACK
 - 🌐 **IP Certificates** — No domain required; auto-generates IP-based TLS certificates
 - 🔄 **Auto Cert Renewal** — Self-signed certs auto-renew 30 days before expiry with hot-reload
@@ -121,7 +122,7 @@ Recommended clients:
 - iOS / Android: Bria Mobile app
 - Desk phones: Fanvil Linkvil W610W / W620W
 
-Other clients should support SIP over TLS, SDES-SRTP (`AES_CM_128_HMAC_SHA1_80`), and configurable self-signed certificate verification behavior.
+Other clients should support SIP over TLS, SDES-SRTP (`AES_CM_128_HMAC_SHA1_80` or `AEAD_AES_128_GCM`), and configurable self-signed certificate verification behavior.
 
 | Setting | Value |
 |:--------|:------|
@@ -168,6 +169,7 @@ Other clients should support SIP over TLS, SDES-SRTP (`AES_CM_128_HMAC_SHA1_80`)
 | `BYE` | End call, release media resources |
 | `CANCEL` | Cancel unanswered call |
 | `OPTIONS` | Keepalive / capability query |
+| `MESSAGE` | Extension-to-extension instant messaging; queued while offline and auto-delivered on registration |
 
 ## Project Structure
 
@@ -193,7 +195,7 @@ minghe/
     │   └── transaction.rs    # Transaction tracking and timeout cleanup
     └── media/
         ├── mod.rs
-        ├── srtp.rs           # RFC 3711 SRTP implementation
+        ├── srtp.rs           # RFC 3711 / RFC 7714 SRTP implementation (AES-CM / AES-GCM)
         └── relay.rs          # UDP media relay
 ```
 
