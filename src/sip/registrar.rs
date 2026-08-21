@@ -5,7 +5,7 @@
 
 use md5::{Digest, Md5};
 use rand::Rng;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 
@@ -55,6 +55,39 @@ pub struct RegistrarService {
     /// 分机号码范围
     range_start: u32,
     range_end: u32,
+    /// IP -> 窗口内失败记录（达到阈值后移入封锁表并移除本表条目）
+    failed_ips: RwLock<HashMap<String, FailedIpEntry>>,
+    /// 已被封锁的 IP（窗口内累计失败达到阈值，进程生命周期内不解封）
+    blocked_ips: RwLock<HashSet<String>>,
+}
+
+/// 单个 IP 在失败窗口内的计数记录
+#[derive(Debug, Clone, Copy)]
+struct FailedIpEntry {
+    /// 窗口内失败次数
+    count: u32,
+    /// 窗口起点（Unix 秒），超过窗口自动重置/清理
+    window_start: u64,
+}
+
+/// IP 在失败窗口内累计失败达到该次数即被永久封锁
+const MAX_REGISTER_FAILURES: u32 = 3;
+
+/// 失败计数滑动窗口（秒）：窗口外的失败自动过期，避免合法用户被长期累计误伤
+const FAILURE_WINDOW_SECS: u64 = 600;
+
+/// `failed_ips` 表最大条目数，防止攻击者用海量不同 IP 撑爆内存
+const MAX_FAILED_IPS: usize = 100_000;
+
+/// `blocked_ips` 表最大条目数，达到上限后不再新增封锁（内存保护，降级为仅告警）
+const MAX_BLOCKED_IPS: usize = 50_000;
+
+/// 当前 Unix 秒
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 impl RegistrarService {
@@ -76,7 +109,95 @@ impl RegistrarService {
             passwords,
             range_start,
             range_end,
+            failed_ips: RwLock::new(HashMap::new()),
+            blocked_ips: RwLock::new(HashSet::new()),
         }
+    }
+
+    /// 检查指定 IP 是否已被封锁
+    ///
+    /// `pub(crate)`：供 [Router] 在 INVITE 等其它方法上复用同一封锁表。
+    pub(crate) fn is_blocked(&self, ip: &str) -> bool {
+        self.blocked_ips.read().unwrap().contains(ip)
+    }
+
+    /// 记录一次失败（注册、认证或未认证呼叫探测）；窗口内累计达到阈值后封锁该 IP 并返回 `true`
+    ///
+    /// 失败计数使用滑动窗口（[FAILURE_WINDOW_SECS]）：窗口外的失败自动过期，
+    /// 避免合法用户因历史偶发失败被永久累计误伤。窗口内累计达到阈值后，该 IP
+    /// 被移入封锁表（进程生命周期内不解封）。
+    ///
+    /// 两张表均有容量上限（[MAX_FAILED_IPS] / [MAX_BLOCKED_IPS]），防止攻击者
+    /// 用海量不同 IP 撑爆内存；达到上限时优先清理过期条目，仍满则清空失败表
+    /// 或拒绝新增封锁并告警（降级为仅限流，不崩溃）。
+    ///
+    /// `pub(crate)`：供 [Router] 在 INVITE 等其它方法上复用同一失败计数。
+    pub(crate) fn record_failure(&self, ip: &str) -> bool {
+        let now = now_secs();
+        {
+            let mut failed = self.failed_ips.write().unwrap();
+
+            // 容量上限：先清理窗口过期条目，仍超限则清空失败表（丢计数换取内存安全）
+            if failed.len() >= MAX_FAILED_IPS {
+                failed.retain(|_, e| now.saturating_sub(e.window_start) < FAILURE_WINDOW_SECS);
+                if failed.len() >= MAX_FAILED_IPS {
+                    tracing::warn!(
+                        "failed_ips 表超过上限 ({} 条) 且无过期条目可清理，清空失败表以保护内存",
+                        MAX_FAILED_IPS
+                    );
+                    failed.clear();
+                }
+            }
+
+            let entry = failed.entry(ip.to_string()).or_insert(FailedIpEntry {
+                count: 0,
+                window_start: now,
+            });
+            // 窗口过期：重置计数，重新开始窗口
+            if now.saturating_sub(entry.window_start) >= FAILURE_WINDOW_SECS {
+                entry.count = 0;
+                entry.window_start = now;
+            }
+            entry.count += 1;
+            let count = entry.count;
+
+            if count < MAX_REGISTER_FAILURES {
+                tracing::warn!(
+                    ip = %ip,
+                    "认证/呼叫失败 {}/{}（{}s 窗口内达到 {} 次将封锁）",
+                    count,
+                    MAX_REGISTER_FAILURES,
+                    FAILURE_WINDOW_SECS,
+                    MAX_REGISTER_FAILURES
+                );
+                return false;
+            }
+
+            // 达到阈值：移入封锁表（本表条目移除），窗口内单线程已持写锁，无并发丢计数
+            failed.remove(ip);
+        }
+
+        let mut blocked = self.blocked_ips.write().unwrap();
+        if blocked.len() >= MAX_BLOCKED_IPS {
+            tracing::warn!(
+                ip = %ip,
+                "blocked_ips 表已满 ({} 条)，拒绝新增封锁（内存保护降级）",
+                MAX_BLOCKED_IPS
+            );
+            return false;
+        }
+        blocked.insert(ip.to_string());
+        tracing::warn!(
+            ip = %ip,
+            "认证/呼叫失败累计 {} 次，已永久封锁该 IP",
+            MAX_REGISTER_FAILURES
+        );
+        true
+    }
+
+    /// 清除指定 IP 的失败计数（注册/认证成功时调用，避免合法用户被历史失败累计误伤）
+    pub(crate) fn clear_failures(&self, ip: &str) {
+        self.failed_ips.write().unwrap().remove(ip);
     }
 
     /// 获取指定分机的密码
@@ -101,6 +222,17 @@ impl RegistrarService {
     ///      - 成功：注册/注销，返回 200 OK
     ///      - 失败：返回 403 Forbidden
     pub fn handle_register(&self, request_text: &str, from_addr: SocketAddr) -> Vec<u8> {
+        // 来源 IP（封禁按 IP 维度统计，不含端口）
+        let ip = from_addr.ip().to_string();
+
+        // 已被封锁的 IP 直接拒绝，不再进入任何认证流程
+        if self.is_blocked(&ip) {
+            // 已达封锁阈值的 IP 高频刷请求，若逐条打 WARN 日志会刷屏；
+            // 降为 debug（默认日志级别不输出），仅记录一次封锁事件即可。
+            tracing::debug!(ip = %ip, "该 IP 已因多次注册失败被封锁，拒绝其 REGISTER 请求");
+            return parser::build_response(request_text, 403, "Forbidden");
+        }
+
         // 提取分机号
         let extension = if let Some(uri) = parser::extract_uri_from_header(request_text, "To") {
             parser::extract_extension(&uri)
@@ -113,7 +245,8 @@ impl RegistrarService {
         let extension = match extension {
             Some(ext) => ext,
             None => {
-                tracing::warn!("REGISTER 请求缺少有效的分机号");
+                tracing::warn!(ip = %ip, "REGISTER 请求缺少有效的分机号");
+                self.record_failure(&ip);
                 return parser::build_response(request_text, 400, "Bad Request");
             }
         };
@@ -122,18 +255,21 @@ impl RegistrarService {
         let ext_num: u32 = match extension.parse() {
             Ok(n) => n,
             Err(_) => {
-                tracing::warn!("无效的分机号格式: {}", extension);
+                tracing::warn!(ip = %ip, "无效的分机号格式: {}", extension);
+                self.record_failure(&ip);
                 return parser::build_response(request_text, 403, "Forbidden");
             }
         };
 
         if ext_num < self.range_start || ext_num > self.range_end {
             tracing::warn!(
+                ip = %ip,
                 "分机号 {} 不在有效范围 {}-{} 内",
                 extension,
                 self.range_start,
                 self.range_end
             );
+            self.record_failure(&ip);
             return parser::build_response(request_text, 403, "Forbidden");
         }
 
@@ -183,12 +319,15 @@ impl RegistrarService {
                     params.nc.as_deref(),
                     params.cnonce.as_deref(),
                 ) {
-                    tracing::warn!("分机 {} 认证失败（来自 {}）", extension, from_addr);
+                    tracing::warn!(ip = %ip, "分机 {} 认证失败", extension);
+                    self.record_failure(&ip);
                     return parser::build_response(request_text, 403, "Forbidden");
                 }
 
                 // 认证成功
                 tracing::info!("分机 {} 认证成功（来自 {}）", extension, from_addr);
+                // 成功清除该 IP 的失败计数，避免历史偶发失败累计到封锁阈值
+                self.clear_failures(&ip);
 
                 // 检查 Expires
                 let expires = parser::extract_expires(request_text).unwrap_or(3600);
@@ -238,7 +377,9 @@ impl RegistrarService {
     }
 
     /// 注册或更新分机
-    fn register(&self, reg: Registration) {
+    ///
+    /// `pub(crate)`：供本 crate 测试直接注入注册条目（生产路径由 [handle_register] 调用）。
+    pub(crate) fn register(&self, reg: Registration) {
         let ext = reg.extension.clone();
         let mut map = self.registrations.write().unwrap();
         tracing::info!("分机 {} 注册成功，联系地址: {}", ext, reg.contact);
@@ -562,5 +703,230 @@ mod tests {
     fn test_generate_nonce() {
         let nonce = generate_nonce();
         assert_eq!(nonce.len(), 32); // 16 bytes = 32 hex chars
+    }
+
+    /// 构造一条面向 example.com 的 REGISTER 请求
+    fn register_request(ext: &str, call_id: &str, auth_header: &str) -> String {
+        format!(
+            "REGISTER sip:example.com SIP/2.0\r\n\
+             Via: SIP/2.0/TLS 127.0.0.1:6060;branch=z9hG4bK{0}\r\n\
+             From: <sip:{1}@example.com>;tag=tag-{0}\r\n\
+             To: <sip:{1}@example.com>\r\n\
+             Call-ID: {0}\r\n\
+             CSeq: 1 REGISTER\r\n\
+             {2}Contact: <sip:{1}@127.0.0.1:6060;transport=tls>\r\n\
+             Expires: 300\r\n\
+             Content-Length: 0\r\n\r\n",
+            call_id, ext, auth_header
+        )
+    }
+
+    #[test]
+    fn ip_blocked_after_three_register_failures() {
+        let registrar = RegistrarService::new(
+            "example.com".to_string(),
+            "pw".to_string(),
+            HashMap::new(),
+            1000,
+            2000,
+        );
+        let from: SocketAddr = "203.0.113.9:5061".parse().unwrap();
+
+        // 连续 3 次请求范围外分机（攻击者典型行为）→ 第 3 次后应封锁
+        for i in 0..3 {
+            let resp = registrar.handle_register(
+                &register_request("80001", &format!("fail-{}", i), ""),
+                from,
+            );
+            assert_eq!(
+                parser::extract_status_code(&String::from_utf8(resp).unwrap()),
+                Some(403)
+            );
+        }
+        assert!(registrar.is_blocked("203.0.113.9"));
+
+        // 封锁后，合法分机也被同 IP 拒绝
+        for i in 0..2 {
+            let resp = registrar.handle_register(
+                &register_request("1001", &format!("blocked-{}", i), ""),
+                from,
+            );
+            assert_eq!(
+                parser::extract_status_code(&String::from_utf8(resp).unwrap()),
+                Some(403)
+            );
+        }
+        assert!(!registrar.is_registered("1001"));
+
+        // 其他 IP 不受影响，仍可获得 401 挑战
+        let other: SocketAddr = "198.51.100.7:5061".parse().unwrap();
+        let resp = registrar.handle_register(
+            &register_request("1001", "other-ip", ""),
+            other,
+        );
+        assert!(String::from_utf8(resp)
+            .unwrap()
+            .starts_with("SIP/2.0 401 Unauthorized"));
+    }
+
+    #[test]
+    fn ip_block_counts_by_ip_regardless_of_port() {
+        let registrar = RegistrarService::new(
+            "example.com".to_string(),
+            "pw".to_string(),
+            HashMap::new(),
+            1000,
+            2000,
+        );
+        // 同一 IP 不同端口（攻击者高频换端口）累计失败同样封禁该 IP
+        for port in [5061u16, 5300, 5500] {
+            let from: SocketAddr = format!("203.0.113.20:{}", port).parse().unwrap();
+            let resp = registrar.handle_register(
+                &register_request("99999", &format!("port-{}", port), ""),
+                from,
+            );
+            // 请求范围外分机应被拒绝 403 并计入该 IP 失败
+            assert_eq!(
+                parser::extract_status_code(&String::from_utf8(resp).unwrap()),
+                Some(403)
+            );
+        }
+        // 三次失败（三个不同端口）来自同一 IP → 应已封锁
+        assert!(registrar.is_blocked("203.0.113.20"));
+    }
+
+    #[test]
+    fn successful_register_clears_failed_count() {
+        let registrar = RegistrarService::new(
+            "example.com".to_string(),
+            "pw".to_string(),
+            HashMap::new(),
+            1000,
+            2000,
+        );
+        let from: SocketAddr = "203.0.113.30:5061".parse().unwrap();
+
+        // 2 次失败（未达阈值），随后一次合法 REGISTER 认证成功
+        for i in 0..2 {
+            let resp = registrar.handle_register(
+                &register_request("80001", &format!("fail-{}", i), ""),
+                from,
+            );
+            assert_eq!(
+                parser::extract_status_code(&String::from_utf8(resp).unwrap()),
+                Some(403)
+            );
+        }
+        // 成功认证：Digest 响应正确，应返回 200 并清除该 IP 失败计数
+        let ha1 = md5_hex("1001:example.com:pw");
+        let ha2 = md5_hex("REGISTER:sip:example.com");
+        let response = md5_hex(&format!("{}:testnonce:{}", ha1, ha2));
+        let auth = format!(
+            "Authorization: Digest username=\"1001\", realm=\"example.com\", nonce=\"testnonce\", uri=\"sip:example.com\", response=\"{}\"\r\n",
+            response
+        );
+        let resp = registrar.handle_register(&register_request("1001", "ok", &auth), from);
+        assert!(String::from_utf8(resp)
+            .unwrap()
+            .starts_with("SIP/2.0 200 OK"));
+        assert!(!registrar.is_blocked("203.0.113.30"));
+
+        // 清除后重新失败：累计 2 次不封锁，第 3 次才封锁（证明计数已被重置）
+        for i in 0..2 {
+            let resp = registrar.handle_register(
+                &register_request("80002", &format!("fail2-{}", i), ""),
+                from,
+            );
+            let _ = resp;
+        }
+        assert!(!registrar.is_blocked("203.0.113.30"), "失败计数应已重置");
+        let resp = registrar.handle_register(
+            &register_request("80003", "fail3", ""),
+            from,
+        );
+        let _ = resp;
+        assert!(registrar.is_blocked("203.0.113.30"), "重置后第 3 次失败应封锁");
+    }
+
+    #[test]
+    fn failures_expire_after_window_without_blocking() {
+        let registrar = RegistrarService::new(
+            "example.com".to_string(),
+            "pw".to_string(),
+            HashMap::new(),
+            1000,
+            2000,
+        );
+        // 2 次失败（count=2），随后直接把窗口起点拨到窗口外
+        for i in 0..2 {
+            registrar.record_failure("203.0.113.40");
+            let _ = i;
+        }
+        {
+            let mut failed = registrar.failed_ips.write().unwrap();
+            if let Some(entry) = failed.get_mut("203.0.113.40") {
+                entry.window_start =
+                    now_secs().saturating_sub(FAILURE_WINDOW_SECS + 1);
+            }
+        }
+        // 窗口外的历史失败不参与累计：再失败 2 次也不应封锁
+        assert!(!registrar.record_failure("203.0.113.40"));
+        assert!(!registrar.record_failure("203.0.113.40"));
+        assert!(!registrar.is_blocked("203.0.113.40"));
+    }
+
+    #[test]
+    fn failed_table_respects_capacity_cap() {
+        let registrar = RegistrarService::new(
+            "example.com".to_string(),
+            "pw".to_string(),
+            HashMap::new(),
+            1000,
+            2000,
+        );
+        // 填满失败表（模拟扫描器海量不同 IP）
+        let now = now_secs();
+        {
+            let mut failed = registrar.failed_ips.write().unwrap();
+            for i in 0..MAX_FAILED_IPS {
+                failed.insert(
+                    format!("198.51.{}.{}", (i >> 8) % 256, i % 256),
+                    FailedIpEntry {
+                        count: 1,
+                        window_start: now,
+                    },
+                );
+            }
+        }
+        // 表已满且无过期条目：record_failure 应清空表并正常计数，不死锁/不 panic
+        assert!(!registrar.record_failure("203.0.113.50"));
+        let len = registrar.failed_ips.read().unwrap().len();
+        assert!(len < MAX_FAILED_IPS, "超限后应清理失败表, got {len}");
+        // 清理后新 IP 仍能正常累计并封锁
+        for _ in 0..2 {
+            registrar.record_failure("203.0.113.50");
+        }
+        assert!(registrar.is_blocked("203.0.113.50"));
+    }
+
+    #[test]
+    fn blocked_table_respects_capacity_cap() {
+        let registrar = RegistrarService::new(
+            "example.com".to_string(),
+            "pw".to_string(),
+            HashMap::new(),
+            1000,
+            2000,
+        );
+        // 直接填满封锁表
+        {
+            let mut blocked = registrar.blocked_ips.write().unwrap();
+            for i in 0..MAX_BLOCKED_IPS {
+                blocked.insert(format!("198.51.{}.{}", (i >> 8) % 256, i % 256));
+            }
+        }
+        // 表满后新增封锁被拒绝（内存保护降级），不 panic
+        assert!(!registrar.record_failure("203.0.113.60"));
+        assert!(!registrar.is_blocked("203.0.113.60"));
     }
 }

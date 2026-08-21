@@ -302,9 +302,11 @@ async fn process_sip_message(
                 }
             }
             "INVITE" => {
+                // 主叫分机号取自连接认证的分机（不信任 From 头，防伪造）
+                let from_ext = state.get_connection_extension(&peer_addr).unwrap_or_default();
                 let response = state
                     .router
-                    .handle_invite(msg_text, writer_tx.clone())
+                    .handle_invite(msg_text, writer_tx.clone(), peer_addr, &from_ext)
                     .await;
                 let _ = writer_tx.send(response).await;
             }

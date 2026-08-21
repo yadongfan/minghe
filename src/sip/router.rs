@@ -169,11 +169,28 @@ impl Router {
         &self,
         request_text: &str,
         caller_writer: mpsc::Sender<Vec<u8>>,
+        from_addr: SocketAddr,
+        from_ext: &str,
     ) -> Vec<u8> {
-        // 提取主叫分机号
-        let caller_ext = parser::extract_uri_from_header(request_text, "From")
-            .and_then(|uri| parser::extract_extension(&uri))
-            .unwrap_or_default();
+        let ip = from_addr.ip().to_string();
+
+        // 已被 IP 封锁的来源直接拒绝，不进入任何处理（与 REGISTER 共用封锁表）
+        if self.registrar.is_blocked(&ip) {
+            return parser::build_response(request_text, 403, "Forbidden");
+        }
+
+        // 主叫身份校验：信任连接层已认证的分机号（server 在 REGISTER 成功后绑定），
+        // 不信任 From 头（客户端可伪造）。未认证连接发起的 INVITE 属于探测/扫描，
+        // 直接拒绝并计入该 IP 的失败（窗口内累计达到阈值即封锁）。
+        // 拒绝路径打 debug，避免扫描日志刷屏。
+        if from_ext.is_empty() {
+            tracing::debug!(
+                ip = %ip,
+                "拒绝未认证连接发起的 INVITE，计入该 IP 失败"
+            );
+            self.registrar.record_failure(&ip);
+            return parser::build_response(request_text, 403, "Forbidden");
+        }
 
         // 提取被叫分机号。多数客户端放在 Request-URI；部分客户端会把
         // Request-URI 指向服务器本身，把真实被叫放在 To 头里。
@@ -184,7 +201,7 @@ impl Router {
 
         tracing::info!(
             "收到 INVITE: {} -> {} (Call-ID: {})",
-            caller_ext,
+            from_ext,
             callee_ext,
             call_id
         );
@@ -236,7 +253,7 @@ impl Router {
                 Some((tag, crypto)) => {
                     tracing::debug!(
                         "主叫 {} 提供 a=crypto (tag={}, suite={})，使用强制 SRTP B2BUA 模式",
-                        caller_ext,
+                        from_ext,
                         tag,
                         crypto.suite_name()
                     );
@@ -301,13 +318,13 @@ impl Router {
             &rebuilt,
             &target_uri,
             &self.domain,
-            &server_contact_uri(&caller_ext, &self.domain),
+            &server_contact_uri(from_ext, &self.domain),
         );
 
         // 存储呼叫信息
         let call_info = CallInfo {
             call_id: call_id.clone(),
-            caller_ext: caller_ext.clone(),
+            caller_ext: from_ext.to_string(),
             callee_ext: callee_ext.clone(),
             caller_tag,
             callee_tag: None,
@@ -1241,6 +1258,32 @@ fn extract_audio_media_addr_from_sdp(sdp: &str) -> Option<SocketAddr> {
 mod tests {
     use super::*;
 
+    /// 构造带内存通道的测试 Router，返回 (router, caller_tx, _caller_rx)
+    fn test_router_with_writer() -> (Router, mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) {
+        let registrar = Arc::new(RegistrarService::new(
+            "example.com".to_string(),
+            "secret".to_string(),
+            HashMap::new(),
+            1000,
+            1999,
+        ));
+        let media = Arc::new(MediaRelayManager::new(
+            41000,
+            41999,
+            "127.0.0.1".to_string(),
+        ));
+        let router = Router::new(
+            Arc::clone(&registrar),
+            media,
+            "example.com".to_string(),
+            "127.0.0.1".to_string(),
+            1000,
+            1999,
+        );
+        let (caller_tx, caller_rx) = mpsc::channel(16);
+        (router, caller_tx, caller_rx)
+    }
+
     #[test]
     fn forwarded_invite_response_preserves_callee_to_tag_and_adds_server_contact() {
         let original_invite = concat!(
@@ -1640,5 +1683,112 @@ mod tests {
             extract_audio_media_addr_from_sdp(sdp),
             Some("192.168.1.20:4000".parse().unwrap())
         );
+    }
+
+    #[tokio::test]
+    async fn invite_from_unauthenticated_connection_is_rejected_and_counts_failure() {
+        let (router, caller_tx, _caller_rx) = test_router_with_writer();
+        let from: SocketAddr = "203.0.113.50:5061".parse().unwrap();
+
+        let invite = concat!(
+            "INVITE sip:0048422032120@example.com SIP/2.0\r\n",
+            "Via: SIP/2.0/TLS scan.example.com;branch=z9hG4bKinv1\r\n",
+            "From: <sip:5@example.com>;tag=tag1\r\n",
+            "To: <sip:0048422032120@example.com>\r\n",
+            "Call-ID: cid-scan\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Content-Length: 0\r\n\r\n"
+        );
+
+        // 未认证连接发起的 INVITE（攻击者探测）应被拒绝 403，且每次计入该 IP 失败
+        for _ in 0..3 {
+            let resp = router
+                .handle_invite(&invite, caller_tx.clone(), from, "")
+                .await;
+            assert_eq!(
+                parser::extract_status_code(&String::from_utf8(resp).unwrap()),
+                Some(403)
+            );
+        }
+
+        // 窗口内累计 3 次失败后该 IP 被永久封锁
+        assert!(router.registrar.is_blocked("203.0.113.50"));
+
+        // 封锁后再次 INVITE 仍被直接拒绝
+        let resp = router
+            .handle_invite(&invite, caller_tx.clone(), from, "")
+            .await;
+        assert_eq!(
+            parser::extract_status_code(&String::from_utf8(resp).unwrap()),
+            Some(403)
+        );
+    }
+
+    #[tokio::test]
+    async fn invite_from_authenticated_extension_is_not_rejected_by_auth_guard() {
+        let (router, caller_tx, _caller_rx) = test_router_with_writer();
+        let from: SocketAddr = "127.0.0.1:5061".parse().unwrap();
+
+        // 模拟 1001 已通过 REGISTER 认证并绑定到本连接（server 层行为）
+        router
+            .registrar
+            .register(crate::sip::registrar::Registration {
+                extension: "1001".to_string(),
+                contact: "<sip:1001@client.invalid>".to_string(),
+                expires_at: u64::MAX,
+                transport_addr: "127.0.0.1:5061".parse().unwrap(),
+            });
+
+        let invite = concat!(
+            "INVITE sip:1002@example.com SIP/2.0\r\n",
+            "Via: SIP/2.0/TLS client.example.com;branch=z9hG4bKinv2\r\n",
+            "From: <sip:1001@example.com>;tag=tag2\r\n",
+            "To: <sip:1002@example.com>\r\n",
+            "Call-ID: cid-ok\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Content-Length: 0\r\n\r\n"
+        );
+
+        let resp = router
+            .handle_invite(&invite, caller_tx, from, "1001")
+            .await;
+        let code = parser::extract_status_code(&String::from_utf8(resp).unwrap());
+        // 合法主叫不应被 403 拦截；被叫 1002 未注册 → 应返回 404
+        assert_eq!(code, Some(404));
+    }
+
+    #[tokio::test]
+    async fn invite_with_forged_from_header_uses_authenticated_identity() {
+        let (router, caller_tx, _caller_rx) = test_router_with_writer();
+        let from: SocketAddr = "127.0.0.1:5061".parse().unwrap();
+
+        // 连接已认证为 1001，但请求伪造 From 头为 9999（绕过注册检查的攻击手段）
+        router
+            .registrar
+            .register(crate::sip::registrar::Registration {
+                extension: "1001".to_string(),
+                contact: "<sip:1001@client.invalid>".to_string(),
+                expires_at: u64::MAX,
+                transport_addr: "127.0.0.1:5061".parse().unwrap(),
+            });
+
+        let invite = concat!(
+            "INVITE sip:1002@example.com SIP/2.0\r\n",
+            "Via: SIP/2.0/TLS client.example.com;branch=z9hG4bKinv3\r\n",
+            "From: <sip:9999@example.com>;tag=tag3\r\n",
+            "To: <sip:1002@example.com>\r\n",
+            "Call-ID: cid-forged\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Content-Length: 0\r\n\r\n"
+        );
+
+        // 身份取自连接认证分机（1001），From 头伪造不触发 403；
+        // 该 IP 也未累计失败，不会被封锁
+        let resp = router
+            .handle_invite(&invite, caller_tx, from, "1001")
+            .await;
+        let code = parser::extract_status_code(&String::from_utf8(resp).unwrap());
+        assert_eq!(code, Some(404));
+        assert!(!router.registrar.is_blocked("127.0.0.1"));
     }
 }
