@@ -603,23 +603,18 @@ impl SrtpCryptoSuite {
         result
     }
 
-    /// RFC 7714 GCM 套件：构造 96 位 IV
+    /// RFC 7714 §8.1 GCM 套件：构造 96 位 IV
     ///
-    /// IV = (SSRC || ROC || SEQ) XOR session_salt 低 96 位（12 字节），其中：
-    /// - SSRC：32 位
-    /// - ROC：32 位
-    /// - SEQ：32 位，**高 16 位为 RTP 序列号、低 16 位为 0**（RFC 7714 §4.1，
-    ///   与 libsrtp 等标准实现一致）
+    /// 先拼接 2 字节 0x0000 || SSRC(4) || ROC(4) || SEQ(2)，共 12 字节，
+    /// 再与 96 位 session salt 逐字节异或，得到 12 字节 IV。
+    /// 布局与 RFC 7714 Figure 1 及 libsrtp 的 srtp_calc_aead_iv 完全一致。
     fn gcm_iv(&self, ssrc: u32, roc: u32, sequence: u16) -> [u8; 12] {
-        let mut iv = [0u8; 12];
-        let ssrc_b = ssrc.to_be_bytes();
-        let roc_b = roc.to_be_bytes();
-        // 序列号左移 16 位：占 32 位字段的高 16 位，低 16 位为 0
-        let seq_b = ((sequence as u32) << 16).to_be_bytes();
-        for i in 0..4 {
-            iv[i] = ssrc_b[i] ^ self.session_salt[i];
-            iv[4 + i] = roc_b[i] ^ self.session_salt[4 + i];
-            iv[8 + i] = seq_b[i] ^ self.session_salt[8 + i];
+        let mut iv = [0u8; 12]; // iv[0..2] = 00 00（RFC 7714 要求的前缀）
+        iv[2..6].copy_from_slice(&ssrc.to_be_bytes());
+        iv[6..10].copy_from_slice(&roc.to_be_bytes());
+        iv[10..12].copy_from_slice(&sequence.to_be_bytes());
+        for i in 0..12 {
+            iv[i] ^= self.session_salt[i];
         }
         iv
     }
@@ -1106,8 +1101,8 @@ mod tests {
         assert!(gcm.unprotect_rtp(&aes_srtp).is_err());
     }
 
-    /// 测试 GCM IV 构造（RFC 7714 §4.1：96 位 IV = (SSRC || ROC || SEQ) XOR salt，
-    /// 其中 SEQ 为 32 位、高 16 位是序列号、低 16 位为 0——与 libsrtp 等标准实现一致）
+    /// 测试 GCM IV 构造（RFC 7714 §8.1：IV = 00 00 || SSRC || ROC || SEQ，
+    /// 再与 96 位 salt 逐字节 XOR——与 libsrtp 等标准实现一致）
     #[test]
     fn test_gcm_iv_construction() {
         let suite = SrtpCryptoSuite {
@@ -1126,28 +1121,32 @@ mod tests {
 
         let iv = suite.gcm_iv(ssrc, roc, seq);
 
-        let mut expected = [0u8; 12];
-        let mut parts = [0u8; 12];
-        parts[0..4].copy_from_slice(&ssrc.to_be_bytes());
-        parts[4..8].copy_from_slice(&roc.to_be_bytes());
-        // 序列号占 32 位字段的高 16 位，低 16 位为 0
-        parts[8..12].copy_from_slice(&((seq as u32) << 16).to_be_bytes());
+        // 期望：先构造 00 00 || SSRC || ROC || SEQ（12 字节），再与 12 字节 salt 异或
+        let mut expected = [0u8; 12]; // 前 2 字节为 00 00
+        expected[2..6].copy_from_slice(&ssrc.to_be_bytes());
+        expected[6..10].copy_from_slice(&roc.to_be_bytes());
+        expected[10..12].copy_from_slice(&seq.to_be_bytes());
         for i in 0..12 {
-            expected[i] = parts[i] ^ suite.session_salt[i];
+            expected[i] ^= suite.session_salt[i];
         }
         assert_eq!(&iv[..], &expected[..]);
 
-        // 显式断言 SEQ 位于高 16 位（iv[8..10]），低 16 位为 0（iv[10..12] 仅由 salt 决定）
-        assert_eq!(iv[8], suite.session_salt[8] ^ ((seq >> 8) as u8));
-        assert_eq!(iv[9], suite.session_salt[9] ^ (seq as u8));
-        assert_eq!(iv[10], suite.session_salt[10]);
-        assert_eq!(iv[11], suite.session_salt[11]);
+        // 显式断言：IV[0..2] 即 00 00 与 salt 异或；SSRC 位于 IV[2..6]、ROC 位于 IV[6..10]、
+        // SEQ 位于 IV[10..12]
+        assert_eq!(iv[0], suite.session_salt[0]);
+        assert_eq!(iv[1], suite.session_salt[1]);
+        assert_eq!(iv[2], suite.session_salt[2] ^ ((ssrc >> 24) as u8));
+        assert_eq!(iv[5], suite.session_salt[5] ^ (ssrc as u8));
+        assert_eq!(iv[6], suite.session_salt[6] ^ ((roc >> 24) as u8));
+        assert_eq!(iv[9], suite.session_salt[9] ^ (roc as u8));
+        assert_eq!(iv[10], suite.session_salt[10] ^ ((seq >> 8) as u8));
+        assert_eq!(iv[11], suite.session_salt[11] ^ (seq as u8));
     }
 
-    /// 与 libsrtp 标准向量一致性的 IV 构造验证
+    /// 与 libsrtp / RFC 7714 一致的 IV 构造验证
     ///
-    /// libsrtp 的 GCM IV：IV[0..3]=SSRC、IV[4..7]=ROC、IV[8..9]=seq 高字节/低字节、
-    /// IV[10..11]=0，再与 12 字节 salt 逐字节 XOR。
+    /// libsrtp 的 srtp_calc_aead_iv（注释直接引用 RFC 7714 §8.1 Figure 1）：
+    /// 先拼接 00 00 || SSRC || ROC || SEQ 共 12 字节，再与 12 字节 salt 逐字节 XOR。
     #[test]
     fn test_gcm_iv_matches_libsrtp_layout() {
         let suite = SrtpCryptoSuite {
@@ -1166,14 +1165,14 @@ mod tests {
 
         let iv = suite.gcm_iv(ssrc, roc, seq);
 
-        // 期望：IV = (SSRC || ROC || (seq<<16)) XOR salt
-        let mut expected = [0u8; 12];
-        expected[0..4].copy_from_slice(&(ssrc ^ 0xA0A1A2A3u32).to_be_bytes());
-        expected[4..8].copy_from_slice(&(roc ^ 0xA4A5A6A7u32).to_be_bytes());
-        expected[8] = (seq >> 8) as u8 ^ 0xA8; // 高字节
-        expected[9] = (seq & 0xFF) as u8 ^ 0xA9; // 低字节
-        expected[10] = 0 ^ 0xAA; // 低 16 位为 0
-        expected[11] = 0 ^ 0xAB;
+        // 期望：IV = (00 00 || SSRC || ROC || SEQ) XOR salt
+        let mut expected = [0u8; 12]; // 前 2 字节为 00 00 前缀
+        expected[0] = 0x00 ^ 0xA0;
+        expected[1] = 0x00 ^ 0xA1;
+        expected[2..6].copy_from_slice(&(ssrc ^ 0xA2A3A4A5u32).to_be_bytes());
+        expected[6..10].copy_from_slice(&(roc ^ 0xA6A7A8A9u32).to_be_bytes());
+        expected[10] = (seq >> 8) as u8 ^ 0xAA; // SEQ 高字节
+        expected[11] = (seq & 0xFF) as u8 ^ 0xAB; // SEQ 低字节
         assert_eq!(iv, expected);
     }
 
