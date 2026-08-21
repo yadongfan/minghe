@@ -9,7 +9,7 @@
 ## 特性
 
 - 🔒 **TLS 信令加密** — SIP over TLS (SIPS)，端口 5061，支持 TLS 1.2/1.3
-- 🎵 **SRTP 媒体加密** — AES_CM_128_HMAC_SHA1_80，SDES 密钥交换
+- 🎵 **SRTP 媒体加密** — AES_CM_128_HMAC_SHA1_80 / AEAD_AES_128_GCM (RFC 7714)，SDES 密钥交换
 - 🔑 **SIP Digest 认证** — MD5 摘要认证，支持默认密码和分机独立密码
 - 📡 **RTP 媒体中继** — 服务器侧透明中继，地址学习，隐藏内部拓扑
 - 💬 **分机即时消息** — SIP MESSAGE 互发文本，离线时暂存、上线后自动补投
@@ -122,7 +122,7 @@ media_addr = "192.168.1.100"     # 必填：客户端可访问的服务器媒体
 - iOS / Android：Bria Mobile app
 - 桌面电话机：方位 Linkvil W610W / W620W
 
-其他客户端需支持 SIP over TLS、SDES-SRTP（`AES_CM_128_HMAC_SHA1_80`）以及可配置自签名证书验证策略。
+其他客户端需支持 SIP over TLS、SDES-SRTP（`AES_CM_128_HMAC_SHA1_80` 或 `AEAD_AES_128_GCM`）以及可配置自签名证书验证策略。
 
 | 配置项 | 值 |
 |:------|:----|
@@ -195,7 +195,7 @@ minghe/
     │   └── transaction.rs    # 事务跟踪与超时清理
     └── media/
         ├── mod.rs
-        ├── srtp.rs           # RFC 3711 SRTP 实现
+        ├── srtp.rs           # RFC 3711 / RFC 7714 SRTP 实现（AES-CM / AES-GCM）
         └── relay.rs          # UDP 媒体中继
 ```
 
