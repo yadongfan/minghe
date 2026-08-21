@@ -25,6 +25,17 @@ const MAX_MESSAGE_REQUEST_LEN: usize = 8192;
 const MAX_OFFLINE_MESSAGES: usize = 100;
 /// 全局离线消息总条数上限（防未注册/过期分机累积导致内存失控）
 const MAX_TOTAL_OFFLINE_MESSAGES: usize = 10000;
+/// 离线消息 TTL（秒）：超过该时长仍未投递的离线消息视为过期，
+/// 在后续暂存或补投时直接丢弃并释放其占用的内存，避免长期累积。
+const OFFLINE_MSG_TTL_SECS: u64 = 24 * 60 * 60; // 24 小时
+/// 发送方速率限制的固定窗口长度（秒）
+const SENDER_RATE_WINDOW_SECS: u64 = 60;
+/// 发送方在一个窗口内允许暂存的离线消息条数上限
+///（60 秒内最多 120 条，即平均 2 条/秒；足以满足正常使用，同时显著拖慢灌队列攻击）
+const SENDER_RATE_LIMIT: u32 = 120;
+/// 单个发送方同时暂存在全局离线队列中的消息条数上限（发送方配额，
+/// 防止单个已认证分机灌满全局队列而让其他用户的离线消息持续被拒）
+const SENDER_OFFLINE_QUOTA: usize = 500;
 
 /// 离线即时消息（分机离线时暂存，注册上线后自动补投）
 #[derive(Debug, Clone)]
@@ -35,6 +46,52 @@ pub struct OfflineMessage {
     pub original_request: String,
     /// 接收时间（Unix 时间戳，秒）
     pub received_at: u64,
+}
+
+/// 发送方离线暂存的固定窗口计数（用于速率限制）
+#[derive(Debug, Clone, Copy)]
+struct SenderRateWindow {
+    window_start: u64,
+    count: u32,
+}
+
+/// 离线消息暂存的结果（用于区分不同拒绝原因，便于日志与测试）
+#[derive(Debug, PartialEq, Eq)]
+enum StoreOutcome {
+    /// 已成功暂存
+    Stored,
+    /// 发送方速率超限
+    RateLimited,
+    /// 发送方配额已满
+    QuotaExceeded,
+    /// 全局离线容量已满
+    CapacityFull,
+}
+
+/// 从离线消息表中清除所有已过期消息，并移除清空的队列。
+/// 返回被清除的消息条数。
+fn prune_expired(map: &mut HashMap<String, VecDeque<OfflineMessage>>, now: u64) -> usize {
+    let mut removed = 0usize;
+    map.retain(|_ext, queue| {
+        let before = queue.len();
+        queue.retain(|m| now < m.received_at.saturating_add(OFFLINE_MSG_TTL_SECS));
+        removed += before - queue.len();
+        !queue.is_empty()
+    });
+    removed
+}
+
+/// 把本次未送达的消息 `pending` 与新到达的现有消息合并写回队列，
+/// 保持“旧消息在前、新消息在后”的全局顺序，并在超出单队列上限时
+/// 从头（最旧）裁剪，避免误删并发新到达的消息。
+fn merge_back(queue: &mut VecDeque<OfflineMessage>, pending: VecDeque<OfflineMessage>) {
+    let existing = std::mem::take(queue);
+    let mut combined = pending;
+    combined.extend(existing);
+    while combined.len() > MAX_OFFLINE_MESSAGES {
+        combined.pop_front();
+    }
+    *queue = combined;
 }
 
 /// 即时消息服务
@@ -52,6 +109,8 @@ pub struct MessageService {
     range_end: u32,
     /// 离线即时消息：被叫分机 -> 待投递消息队列（内存存储，重启即清空）
     offline_messages: RwLock<HashMap<String, VecDeque<OfflineMessage>>>,
+    /// 发送方离线暂存速率状态（固定窗口计数）：分机号 -> 窗口计数
+    sender_rates: RwLock<HashMap<String, SenderRateWindow>>,
 }
 
 impl MessageService {
@@ -70,6 +129,7 @@ impl MessageService {
             range_start,
             range_end,
             offline_messages: RwLock::new(HashMap::new()),
+            sender_rates: RwLock::new(HashMap::new()),
         }
     }
 
@@ -178,32 +238,93 @@ impl MessageService {
 
         // 被叫离线：暂存，等待注册后补投。
         // 只要分机号在配置的 range_start/range_end 范围内即视为合法（离线消息本就是
-        // 发给未登录分机的，不要求其当前已注册）；内存防护由请求总长与全局条数上限兜底。
-        if self.store_offline_message(&callee_ext, from_ext, request_text) {
-            // 回 200 OK：服务端已接收并负责稍后补投（202 Accepted 会令部分客户端异常）
-            parser::build_response(request_text, 200, "OK")
-        } else {
-            // 全局离线容量已满，明确告知客户端未接收
-            parser::build_response(request_text, 503, "Service Unavailable")
+        // 发给未登录分机的，不要求其当前已注册）；内存防护由 TTL、发送方速率/配额、
+        // 请求总长与全局条数上限共同兜底。
+        match self.store_offline_message(&callee_ext, from_ext, request_text) {
+            StoreOutcome::Stored => {
+                // 回 200 OK：服务端已接收并负责稍后补投（202 Accepted 会令部分客户端异常）
+                parser::build_response(request_text, 200, "OK")
+            }
+            _ => {
+                // 速率/配额/全局容量任一超限，明确告知客户端未接收
+                parser::build_response(request_text, 503, "Service Unavailable")
+            }
         }
     }
 
     /// 暂存离线即时消息
     ///
-    /// 返回是否存储成功（全局离线容量已满时返回 false）。
-    fn store_offline_message(&self, callee_ext: &str, from_ext: &str, request_text: &str) -> bool {
+    /// 返回暂存结果（速率超限、发送方配额满或全局容量满时返回对应拒绝原因）。
+    fn store_offline_message(
+        &self,
+        callee_ext: &str,
+        from_ext: &str,
+        request_text: &str,
+    ) -> StoreOutcome {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+
+        // 1) 发送方速率限制（固定窗口：每 SENDER_RATE_WINDOW_SECS 最多 SENDER_RATE_LIMIT 条，
+        //    防止单个已认证分机快速灌入离线队列）
+        {
+            let mut rates = self
+                .sender_rates
+                .write()
+                .expect("sender_rates 锁中毒");
+            let win = rates
+                .entry(from_ext.to_string())
+                .or_insert(SenderRateWindow {
+                    window_start: now,
+                    count: 0,
+                });
+            if now >= win.window_start + SENDER_RATE_WINDOW_SECS {
+                *win = SenderRateWindow {
+                    window_start: now,
+                    count: 0,
+                };
+            }
+            if win.count >= SENDER_RATE_LIMIT {
+                tracing::warn!(
+                    "发送方 {} 离线暂存速率超限（{} 秒内已达 {} 条），拒绝新消息",
+                    from_ext,
+                    SENDER_RATE_WINDOW_SECS,
+                    SENDER_RATE_LIMIT
+                );
+                return StoreOutcome::RateLimited;
+            }
+            win.count += 1;
+        }
 
         let mut map = self
             .offline_messages
             .write()
             .expect("offline_messages 锁中毒");
 
-        // 全局离线消息总条数上限（号码范围内任意分机都可暂存离线消息，
-        // 需要全局兜底防止恶意灌入导致内存失控）
+        // 2) 惰性清理过期消息，释放容量（TTL 兜底，避免积压的旧消息长期占用内存）
+        let expired = prune_expired(&mut map, now);
+        if expired > 0 {
+            tracing::info!("离线暂存前清理 {} 条过期消息", expired);
+        }
+
+        // 3) 发送方配额：同一发送方同时在离线队列中的消息数上限
+        let sender_total = map
+            .values()
+            .flat_map(VecDeque::iter)
+            .filter(|m| m.from_ext == from_ext)
+            .count();
+        if sender_total >= SENDER_OFFLINE_QUOTA {
+            tracing::warn!(
+                "发送方 {} 离线暂存配额已满（{} 条），拒绝新消息",
+                from_ext,
+                SENDER_OFFLINE_QUOTA
+            );
+            return StoreOutcome::QuotaExceeded;
+        }
+
+        // 4) 全局离线消息总条数上限（号码范围内任意分机都可暂存离线消息，
+        //    需要全局兜底防止恶意灌入导致内存失控）
         let total: usize = map.values().map(VecDeque::len).sum();
         if total >= MAX_TOTAL_OFFLINE_MESSAGES {
             tracing::warn!(
@@ -211,7 +332,7 @@ impl MessageService {
                 MAX_TOTAL_OFFLINE_MESSAGES,
                 from_ext
             );
-            return false;
+            return StoreOutcome::CapacityFull;
         }
 
         let queue = map
@@ -238,13 +359,18 @@ impl MessageService {
             from_ext,
             queue.len()
         );
-        true
+        StoreOutcome::Stored
     }
 
     /// 补投分机的离线即时消息（注册上线后由 server 层调用）
     ///
-    /// 取出队列并逐条重建转发；若推送中途失败，将未送达消息写回队列，等待下次投递。
+    /// 取出队列并逐条重建转发；已过期的消息在投递前被丢弃（TTL）；若推送中途失败，
+    /// 将未送达消息与并发新到达消息合并写回队列（保持旧→新顺序），等待下次投递。
     pub async fn deliver_offline_messages(&self, extension: &str) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         let messages: Vec<OfflineMessage> = {
             let mut map = self
                 .offline_messages
@@ -253,6 +379,8 @@ impl MessageService {
             map.remove(extension)
                 .unwrap_or_default()
                 .into_iter()
+                // TTL：已过期的离线消息不再投递，直接释放内存
+                .filter(|m| now < m.received_at.saturating_add(OFFLINE_MSG_TTL_SECS))
                 .collect()
         };
 
@@ -270,9 +398,9 @@ impl MessageService {
                 .offline_messages
                 .write()
                 .expect("offline_messages 锁中毒");
-            map.entry(extension.to_string())
-                .or_insert_with(VecDeque::new)
-                .extend(messages);
+            let queue = map.entry(extension.to_string()).or_default();
+            // 旧消息（本次未投递）排在新到达消息之前，维护全局顺序
+            merge_back(queue, messages.into());
             return;
         };
 
@@ -303,18 +431,16 @@ impl MessageService {
                         e,
                         pending.len() + 1
                     );
-                    // 未送达的消息（含当前失败这条）写回队列，避免丢消息
+                    // 未送达的消息（含当前失败这条）写回队列，避免丢消息。
+                    // 用 merge_back 保证：本次未送达的旧消息排在前，并发新到达的消息排在后，
+                    // 裁剪从头（最旧）进行，不会误删刚收到的消息。
                     pending.push_front(msg);
                     let mut map = self
                         .offline_messages
                         .write()
                         .expect("offline_messages 锁中毒");
                     let queue = map.entry(extension.to_string()).or_default();
-                    queue.extend(pending);
-                    // 防御：极端并发下队列可能轻微超限，裁剪至上限（保留新消息）
-                    while queue.len() > MAX_OFFLINE_MESSAGES {
-                        queue.pop_front();
-                    }
+                    merge_back(queue, pending);
                     break;
                 }
             }
@@ -522,6 +648,12 @@ mod tests {
     #[tokio::test]
     async fn offline_global_cap_rejects_when_full() {
         let (svc, _) = test_service();
+        // 预填消息用近期时间戳（避免被 TTL 清理），发送方用其他分机（避免触发发送方配额），
+        // 从而专门验证“全局容量满”这一层兜底。
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         // 直接填充到全局上限：100 个分机 × 100 条（号码都在范围内）
         {
             let mut map = svc.offline_messages.write().unwrap();
@@ -529,9 +661,9 @@ mod tests {
                 let ext = format!("{}", 1000 + i);
                 let queue: VecDeque<OfflineMessage> = (0..100)
                     .map(|j| OfflineMessage {
-                        from_ext: "1001".to_string(),
+                        from_ext: "9999".to_string(),
                         original_request: format!("MESSAGE dummy {}", j),
-                        received_at: 0,
+                        received_at: now,
                     })
                     .collect();
                 map.insert(ext, queue);
@@ -626,5 +758,146 @@ mod tests {
         // 最旧的被丢弃，最新保留
         assert!(queue.back().unwrap().original_request.contains("msg 109"));
         assert!(!queue.front().unwrap().original_request.contains("msg 0"));
+    }
+
+    /// 构造一条测试用的离线消息（TTL 判断不依赖 received_at，可传任意值）
+    fn om(from: &str, body: &str, received_at: u64) -> OfflineMessage {
+        OfflineMessage {
+            from_ext: from.to_string(),
+            original_request: body.to_string(),
+            received_at,
+        }
+    }
+
+    #[test]
+    fn merge_back_keeps_old_before_new() {
+        // 队列中已存在并发新到达消息 newX，写回 pending 旧消息 oldA/oldB 时，
+        // 顺序必须保持“旧在前、新在后”
+        let pending: VecDeque<OfflineMessage> =
+            vec![om("1001", "oldA", 5), om("1001", "oldB", 6)].into();
+        let mut queue: VecDeque<OfflineMessage> = vec![om("1002", "newX", 7)].into();
+        merge_back(&mut queue, pending);
+        let names: Vec<&str> = queue
+            .iter()
+            .map(|m| m.original_request.as_str())
+            .collect();
+        assert_eq!(names, vec!["oldA", "oldB", "newX"]);
+    }
+
+    #[test]
+    fn merge_back_trims_oldest_not_fresh() {
+        // 超出单队列上限时从头（最旧）裁剪，绝不能删掉并发新到达的消息
+        let pending: VecDeque<OfflineMessage> = (0..95)
+            .map(|i| om("1001", &format!("old{}", i), i as u64))
+            .collect();
+        let mut queue: VecDeque<OfflineMessage> = (0..6)
+            .map(|i| om("1002", &format!("new{}", i), 100 + i as u64))
+            .collect();
+        merge_back(&mut queue, pending);
+        assert_eq!(queue.len(), MAX_OFFLINE_MESSAGES);
+        // 最旧的 old0 被裁掉，其余 old 与全部 new 保留，且顺序为 old 在前、new 在后
+        assert!(!queue.iter().any(|m| m.original_request == "old0"));
+        assert!(queue.iter().any(|m| m.original_request == "new0"));
+        assert!(queue.iter().any(|m| m.original_request == "new5"));
+        assert_eq!(queue.front().unwrap().original_request, "old1");
+        assert_eq!(queue.back().unwrap().original_request, "new5");
+    }
+
+    #[tokio::test]
+    async fn offline_expired_pruned_and_not_delivered() {
+        let (svc, writers) = test_service();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // 往 1002 队列塞一条过期、一条未过期的消息
+        {
+            let mut map = svc.offline_messages.write().unwrap();
+            let queue: VecDeque<OfflineMessage> = vec![
+                om("1001", "fresh", now),
+                om("1001", "stale", now - OFFLINE_MSG_TTL_SECS - 10),
+            ]
+            .into();
+            map.insert("1002".to_string(), queue);
+        }
+
+        let (tx, mut rx) = mpsc::channel(8);
+        writers.write().unwrap().insert("1002".to_string(), tx);
+        svc.deliver_offline_messages("1002").await;
+
+        // 只有未过期的 fresh 被投递，过期 stale 被丢弃
+        let delivered = rx.try_recv().expect("应投递未过期的消息");
+        assert!(String::from_utf8(delivered).unwrap().contains("fresh"));
+        assert!(rx.try_recv().is_err(), "过期消息不应被投递");
+        assert!(svc.offline_messages.read().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn offline_sender_rate_limit_returns_503() {
+        let (svc, _) = test_service();
+        // 第 SENDER_RATE_LIMIT 条仍应成功，第 SENDER_RATE_LIMIT+1 条触发速率限制返回 503
+        for _ in 0..SENDER_RATE_LIMIT {
+            let msg = build_message("1001", "1002", "fast");
+            let resp = svc.handle_message(&msg, "1001").await;
+            assert!(String::from_utf8(resp)
+                .unwrap()
+                .starts_with("SIP/2.0 200 OK"));
+        }
+        let msg = build_message("1001", "1002", "too fast");
+        let resp = svc.handle_message(&msg, "1001").await;
+        assert!(String::from_utf8(resp)
+            .unwrap()
+            .starts_with("SIP/2.0 503 Service Unavailable"));
+    }
+
+    #[tokio::test]
+    async fn offline_sender_quota_exceeded_returns_503() {
+        let (svc, _) = test_service();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // 预填正好达到单发送方配额上限的、来自 1001 的离线消息（暂存到 1006）
+        {
+            let mut map = svc.offline_messages.write().unwrap();
+            let queue: VecDeque<OfflineMessage> = (0..SENDER_OFFLINE_QUOTA)
+                .map(|i| om("1001", &format!("quota {}", i), now))
+                .collect();
+            map.insert("1006".to_string(), queue);
+        }
+        // 1001 已满配额：新离线消息被拒绝
+        let msg = build_message("1001", "1002", "over quota");
+        let resp = svc.handle_message(&msg, "1001").await;
+        assert!(String::from_utf8(resp)
+            .unwrap()
+            .starts_with("SIP/2.0 503 Service Unavailable"));
+        // 1002 没有被写入
+        assert!(!svc.offline_messages.read().unwrap().contains_key("1002"));
+    }
+
+    #[tokio::test]
+    async fn offline_expired_frees_capacity_on_store() {
+        let (svc, _) = test_service();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        {
+            let mut map = svc.offline_messages.write().unwrap();
+            // 大量过期消息占据全局容量
+            let queue: VecDeque<OfflineMessage> = (0..100)
+                .map(|i| om("9999", &format!("stale {}", i), now - OFFLINE_MSG_TTL_SECS - 1))
+                .collect();
+            map.insert("1003".to_string(), queue);
+        }
+        // 新离线暂存时触发惰性清理，过期消息被清除、容量被释放
+        let msg = build_message("1004", "1005", "new after cleanup");
+        let resp = svc.handle_message(&msg, "1004").await;
+        assert!(String::from_utf8(resp)
+            .unwrap()
+            .starts_with("SIP/2.0 200 OK"));
+        let map = svc.offline_messages.read().unwrap();
+        assert!(!map.contains_key("1003"), "过期分机的队列应被清理移除");
+        assert_eq!(map.get("1005").map(|q| q.len()).unwrap_or(0), 1);
     }
 }
