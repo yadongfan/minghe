@@ -11,6 +11,7 @@
 - 🔒 **TLS Signaling Encryption** — SIP over TLS (SIPS) on port 5061, TLS 1.2/1.3
 - 🎵 **SRTP Media Encryption** — AES_CM_128_HMAC_SHA1_80 / AEAD_AES_128_GCM (RFC 7714) with SDES key exchange
 - 🔑 **SIP Digest Authentication** — MD5 digest auth with default and per-extension passwords
+- 🛡️ **IP Blacklist** — Permanently block an IP after 3 registration/auth failures within 10 minutes; anti brute-force and scanning
 - 📡 **RTP Media Relay** — Transparent server-side relay with address learning
 - 💬 **Extension Instant Messaging** — SIP MESSAGE text exchange; messages are queued while offline and auto-delivered on registration
 - 📱 **Internal Extensions** — 1000–2000 range (configurable), INVITE/BYE/CANCEL/ACK
@@ -171,6 +172,16 @@ Other clients should support SIP over TLS, SDES-SRTP (`AES_CM_128_HMAC_SHA1_80` 
 | `OPTIONS` | Keepalive / capability query |
 | `MESSAGE` | Extension-to-extension instant messaging; queued while offline and auto-delivered on registration |
 
+## IP Blacklist
+
+To prevent password brute-force and port scanning, the server automatically blocks malicious source IPs:
+
+- After **3** registration/auth failures from the same IP within **10 minutes**, the IP is **permanently blocked** (resets when the server restarts);
+- A blocked IP cannot register or place calls;
+- Normal use is unaffected: failure count auto-resets after 10 minutes, and is cleared immediately upon a successful login.
+
+> The threshold and the counting window are compile-time constants and cannot be changed via configuration.
+
 ## Project Structure
 
 ```
@@ -190,7 +201,7 @@ minghe/
     │   ├── mod.rs
     │   ├── server.rs         # TLS listener, connection management, routing
     │   ├── parser.rs         # SIP message parsing and building
-    │   ├── registrar.rs      # Digest authentication, registration management
+    │   ├── registrar.rs      # Digest authentication, registration management, IP blacklist
     │   ├── router.rs         # INVITE/ACK/BYE/CANCEL call routing
     │   └── transaction.rs    # Transaction tracking and timeout cleanup
     └── media/
