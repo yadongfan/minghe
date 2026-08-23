@@ -27,3 +27,4 @@
 # 编辑器备份
 *.bak
 *.orig
+.reasonix/

@@ -14,11 +14,13 @@ tokio = { version = "1", features = ["full"] }
 rsip = "0.4"
 anyhow = "1"
 
-# TLS — 显式禁用默认 features，避免编译 aws-lc-rs（其 C 库 aws-lc-sys
-# 在旧版 gcc 上编译失败），只启用项目实际使用的 ring provider。
-tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
-rustls-pemfile = "2"
+# TLS — 使用 native-tls：Windows 编译走系统 Schannel，Linux 走系统 OpenSSL。
+# 原因：HX4G 等老式 VoIP 网关的 ClientHello 缺 signature_algorithms 扩展，
+# 而 rustls 0.23 强制要求该扩展（SignatureAlgorithmsExtensionRequired）导致无法握手；
+# OpenSSL 按 RFC 5246 兼容缺省签名算法，是接入此类设备的唯一可靠途径。
+# Linux 部署需要在 Dockerfile 中安装 libssl-dev（构建）与 libssl3（运行）。
+tokio-native-tls = "0.3"
+native-tls = "0.2"
 rcgen = { version = "0.13", features = ["default"] }
 time = "0.3"
 
@@ -48,3 +50,8 @@ clap = { version = "4", features = ["derive"] }
 # Utilities
 bytes = "1"
 uuid = { version = "1", features = ["v4"] }
+
+# Linux（OpenSSL 后端）上将传统 PKCS#1 私钥转换为 PKCS#8 所需。
+# 不在 Windows 编译（Windows 走 Schannel，无需该转换能力）。
+[target.'cfg(not(windows))'.dependencies]
+openssl = "0.10"
