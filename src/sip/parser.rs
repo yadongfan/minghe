@@ -527,15 +527,22 @@ pub fn extract_body(msg: &str) -> Option<String> {
 /// 在 TCP 缓冲区中查找完整的 SIP 消息边界。
 /// SIP over TCP 使用 Content-Length 头部来确定消息体长度。
 ///
-/// 返回完整消息的总字节长度（头部 + 空行 + 消息体），
-/// 如果缓冲区中没有完整消息则返回 None。
-pub fn frame_sip_message(buf: &[u8]) -> Option<usize> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SipFrameResult {
+    Complete(usize),
+    Incomplete,
+    Invalid,
+}
+
+/// 返回完整、尚未接收完整或协议错误。非法/冲突的 Content-Length 不能按 0
+/// 处理，否则其消息体会被误当成下一条 SIP 请求。
+pub fn frame_sip_message(buf: &[u8]) -> SipFrameResult {
     // 查找头部结束标记 \r\n\r\n
     let header_end_marker = b"\r\n\r\n";
     let mut header_end_pos = None;
 
     if buf.len() < 4 {
-        return None;
+        return SipFrameResult::Incomplete;
     }
 
     for i in 0..=(buf.len() - 4) {
@@ -545,12 +552,16 @@ pub fn frame_sip_message(buf: &[u8]) -> Option<usize> {
         }
     }
 
-    let header_end = header_end_pos?;
+    let Some(header_end) = header_end_pos else {
+        return SipFrameResult::Incomplete;
+    };
     let headers_with_separator = header_end + 4; // 包括 \r\n\r\n
 
     // 解析 Content-Length 头部
-    let header_text = std::str::from_utf8(&buf[..header_end]).ok()?;
-    let mut content_length: usize = 0;
+    let Ok(header_text) = std::str::from_utf8(&buf[..header_end]) else {
+        return SipFrameResult::Invalid;
+    };
+    let mut content_length: Option<usize> = None;
 
     for line in header_text.lines() {
         let trimmed = line.trim();
@@ -561,18 +572,25 @@ pub fn frame_sip_message(buf: &[u8]) -> Option<usize> {
             } else {
                 trimmed[2..].trim()
             };
-            content_length = value.parse().unwrap_or(0);
-            break;
+            let Ok(parsed) = value.parse::<usize>() else {
+                return SipFrameResult::Invalid;
+            };
+            if content_length.is_some_and(|existing| existing != parsed) {
+                return SipFrameResult::Invalid;
+            }
+            content_length = Some(parsed);
         }
     }
 
-    let total_length = headers_with_separator + content_length;
+    let Some(total_length) = headers_with_separator.checked_add(content_length.unwrap_or(0)) else {
+        return SipFrameResult::Invalid;
+    };
 
     // 检查缓冲区中是否有足够的数据
     if buf.len() >= total_length {
-        Some(total_length)
+        SipFrameResult::Complete(total_length)
     } else {
-        None
+        SipFrameResult::Incomplete
     }
 }
 
@@ -878,25 +896,37 @@ mod tests {
     #[test]
     fn test_frame_sip_message_complete() {
         let msg = b"REGISTER sip:example.com SIP/2.0\r\nContent-Length: 0\r\n\r\n";
-        assert_eq!(frame_sip_message(msg), Some(msg.len()));
+        assert_eq!(frame_sip_message(msg), SipFrameResult::Complete(msg.len()));
     }
 
     #[test]
     fn test_frame_sip_message_with_body() {
         let msg = b"INVITE sip:1001@example.com SIP/2.0\r\nContent-Length: 5\r\n\r\nhello";
-        assert_eq!(frame_sip_message(msg), Some(msg.len()));
+        assert_eq!(frame_sip_message(msg), SipFrameResult::Complete(msg.len()));
     }
 
     #[test]
     fn test_frame_sip_message_incomplete() {
         let msg = b"INVITE sip:1001@example.com SIP/2.0\r\nContent-Length: 100\r\n\r\nhello";
-        assert_eq!(frame_sip_message(msg), None);
+        assert_eq!(frame_sip_message(msg), SipFrameResult::Incomplete);
     }
 
     #[test]
     fn test_frame_sip_message_no_headers_end() {
         let msg = b"REGISTER sip:example.com SIP/2.0\r\nContent-Length: 0\r\n";
-        assert_eq!(frame_sip_message(msg), None);
+        assert_eq!(frame_sip_message(msg), SipFrameResult::Incomplete);
+    }
+
+    #[test]
+    fn test_frame_sip_message_rejects_invalid_content_length() {
+        let msg = b"MESSAGE sip:1001@example.com SIP/2.0\r\nContent-Length: nope\r\n\r\nbody";
+        assert_eq!(frame_sip_message(msg), SipFrameResult::Invalid);
+    }
+
+    #[test]
+    fn test_frame_sip_message_rejects_conflicting_content_lengths() {
+        let msg = b"MESSAGE sip:1001@example.com SIP/2.0\r\nContent-Length: 4\r\nl: 5\r\n\r\nhello";
+        assert_eq!(frame_sip_message(msg), SipFrameResult::Invalid);
     }
 
     #[test]
