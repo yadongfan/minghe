@@ -80,14 +80,6 @@ impl ServerState {
         }
     }
 
-    /// 检查是否仍有其他连接关联到指定分机
-    fn has_connection_for_extension(&self, ext: &str) -> bool {
-        let conns = self.connections.read().unwrap();
-        conns
-            .values()
-            .any(|conn| conn.extension.as_deref() == Some(ext))
-    }
-
     /// 获取连接的分机号
     fn get_connection_extension(&self, peer_addr: &SocketAddr) -> Option<String> {
         let conns = self.connections.read().unwrap();
@@ -188,7 +180,7 @@ async fn handle_connection(
     let mut buffer = Vec::with_capacity(16384);
     let mut read_buf = [0u8; 8192];
 
-    loop {
+    'read_loop: loop {
         let n = match reader.read(&mut read_buf).await {
             Ok(0) => {
                 tracing::info!("连接关闭: {}", peer_addr);
@@ -206,7 +198,7 @@ async fn handle_connection(
         // 尝试从缓冲区中提取完整的 SIP 消息
         loop {
             match parser::frame_sip_message(&buffer) {
-                Some(msg_len) => {
+                parser::SipFrameResult::Complete(msg_len) => {
                     let msg_data = buffer[..msg_len].to_vec();
                     buffer.drain(..msg_len);
 
@@ -217,7 +209,11 @@ async fn handle_connection(
                         tracing::warn!("收到非 UTF-8 SIP 消息 来自 {}", peer_addr);
                     }
                 }
-                None => break, // 缓冲区中无完整消息，继续读取
+                parser::SipFrameResult::Incomplete => break,
+                parser::SipFrameResult::Invalid => {
+                    tracing::warn!("收到非法 SIP 消息帧，断开连接: {}", peer_addr);
+                    break 'read_loop;
+                }
             }
         }
 
@@ -232,7 +228,9 @@ async fn handle_connection(
     let extension = state.remove_connection(&peer_addr);
     if let Some(ext) = &extension {
         tracing::info!("分机 {} 断开连接", ext);
-        if !state.has_connection_for_extension(ext) {
+        if let Some(writer) = state.find_writer_by_extension(ext) {
+            state.router.register_writer(ext, writer);
+        } else {
             state.router.unregister_writer(ext);
         }
     }
@@ -278,7 +276,11 @@ async fn process_sip_message(
                             if let Some(ext) = parser::extract_extension(&uri) {
                                 if parser::extract_expires(msg_text) == Some(0) {
                                     state.clear_connection_extension(&peer_addr);
-                                    state.router.unregister_writer(&ext);
+                                    if let Some(writer) = state.find_writer_by_extension(&ext) {
+                                        state.router.register_writer(&ext, writer);
+                                    } else {
+                                        state.router.unregister_writer(&ext);
+                                    }
                                     tracing::info!("分机 {} 已显式注销连接 {}", ext, peer_addr);
                                 } else {
                                     state.set_connection_extension(&peer_addr, ext.clone());
