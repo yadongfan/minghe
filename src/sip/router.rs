@@ -1266,6 +1266,7 @@ mod tests {
             HashMap::new(),
             1000,
             1999,
+            crate::sip::registrar::IpBlockPolicy::default(),
         ));
         let media = Arc::new(MediaRelayManager::new(
             41000,

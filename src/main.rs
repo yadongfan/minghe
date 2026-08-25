@@ -89,6 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.passwords.clone(),
         config.extensions.range_start,
         config.extensions.range_end,
+        sip::registrar::IpBlockPolicy::from(&config.ip_block),
     ));
 
     // 启动注册清理后台任务

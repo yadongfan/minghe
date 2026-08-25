@@ -464,6 +464,7 @@ mod tests {
             HashMap::new(),
             1000,
             2000,
+            crate::sip::registrar::IpBlockPolicy::default(),
         ));
         let writers = Arc::new(RwLock::new(HashMap::new()));
         let svc = Arc::new(MessageService::new(
