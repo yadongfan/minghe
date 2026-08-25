@@ -415,17 +415,27 @@ impl Router {
                     if call.callee_remote_contact.is_none() {
                         call.callee_remote_contact = parser::extract_contact_uri(response_text);
                     }
-                    if let Some((_, crypto)) = parser::extract_body(response_text)
+                    if let Some((tag, crypto)) = parser::extract_body(response_text)
                         .as_deref()
                         .and_then(extract_srtp_crypto_from_sdp)
                     {
-                        call.callee_remote_crypto = Some(crypto);
-                        call.callee_media_addr = parser::extract_body(response_text)
-                            .as_deref()
-                            .and_then(extract_audio_media_addr_from_sdp);
-                        if call.state != CallState::Established {
-                            call.state = CallState::Established;
-                            tracing::info!("呼叫 {} 已建立（SRTP）", call_id);
+                        if callee_answer_crypto_is_offered(tag, crypto.suite()) {
+                            call.callee_remote_crypto = Some(crypto);
+                            call.callee_media_addr = parser::extract_body(response_text)
+                                .as_deref()
+                                .and_then(extract_audio_media_addr_from_sdp);
+                            if call.state != CallState::Established {
+                                call.state = CallState::Established;
+                                tracing::info!("呼叫 {} 已建立（SRTP）", call_id);
+                            }
+                        } else {
+                            call.state = CallState::Terminated;
+                            tracing::warn!(
+                                "被叫 answer 选择了未提供的 SRTP tag/suite 组合: tag={}, suite={}, Call-ID={}",
+                                tag,
+                                crypto.suite_name(),
+                                call_id
+                            );
                         }
                     } else {
                         call.state = CallState::Terminated;
@@ -1218,6 +1228,13 @@ fn extract_srtp_crypto_from_sdp(sdp: &str) -> Option<(u32, SrtpCryptoSuite)> {
     gcm_fallback
 }
 
+fn callee_answer_crypto_is_offered(tag: u32, suite: SrtpSuite) -> bool {
+    matches!(
+        (tag, suite),
+        (1, SrtpSuite::AesCm128HmacSha180) | (2, SrtpSuite::AeadAes128Gcm)
+    )
+}
+
 fn extract_audio_media_addr_from_sdp(sdp: &str) -> Option<SocketAddr> {
     let mut session_addr = None::<String>;
     let mut audio_addr = None::<String>;
@@ -1283,6 +1300,26 @@ mod tests {
         );
         let (caller_tx, caller_rx) = mpsc::channel(16);
         (router, caller_tx, caller_rx)
+    }
+
+    #[test]
+    fn callee_answer_crypto_must_match_offered_tag_and_suite() {
+        assert!(callee_answer_crypto_is_offered(
+            1,
+            SrtpSuite::AesCm128HmacSha180
+        ));
+        assert!(callee_answer_crypto_is_offered(
+            2,
+            SrtpSuite::AeadAes128Gcm
+        ));
+        assert!(!callee_answer_crypto_is_offered(
+            2,
+            SrtpSuite::AesCm128HmacSha180
+        ));
+        assert!(!callee_answer_crypto_is_offered(
+            1,
+            SrtpSuite::AeadAes128Gcm
+        ));
     }
 
     #[test]
