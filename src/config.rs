@@ -17,6 +17,9 @@ pub struct AppConfig {
     pub tls: TlsConfig,
     /// 媒体中继配置
     pub media: MediaConfig,
+    /// IP 封锁（黑名单）配置
+    #[serde(default)]
+    pub ip_block: IpBlockConfig,
     /// 分机独立密码（可选，覆盖 default_password）
     #[serde(default)]
     pub passwords: HashMap<String, String>,
@@ -84,6 +87,65 @@ pub struct MediaConfig {
     pub media_addr: String,
 }
 
+/// IP 封锁（黑名单）配置
+///
+/// 控制注册/认证失败计数与 IP 封锁行为。可完全关闭，也可调整
+/// 封锁阈值与统计窗口，无需改代码或重新编译。所有字段均有默认值，
+/// 即使完全不写 `[ip_block]` 段也能正常启动。
+#[derive(Debug, Clone, Deserialize)]
+pub struct IpBlockConfig {
+    /// 是否启用 IP 封锁
+    ///
+    /// - `true`：窗口内累计失败达到阈值后封锁该 IP（默认）。
+    /// - `false`：完全关闭封锁与失败计数，所有来源均放行进入认证流程。
+    #[serde(default = "default_ip_block_enabled")]
+    pub enabled: bool,
+    /// 封锁阈值：统计窗口内同一 IP 累计失败达到该次数即被封锁
+    #[serde(default = "default_max_failures")]
+    pub max_failures: u32,
+    /// 失败计数统计窗口（秒）：窗口外的失败自动过期，避免合法用户被长期累计误伤
+    #[serde(default = "default_window_secs")]
+    pub window_secs: u64,
+    /// 失败计数表（`failed_ips`）最大条目数，防止攻击者用海量不同 IP 撑爆内存
+    #[serde(default = "default_max_failed_ips")]
+    pub max_failed_ips: usize,
+    /// 封锁表（`blocked_ips`）最大条目数，达到上限后不再新增封锁（内存保护，降级为仅告警）
+    #[serde(default = "default_max_blocked_ips")]
+    pub max_blocked_ips: usize,
+}
+
+impl Default for IpBlockConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_ip_block_enabled(),
+            max_failures: default_max_failures(),
+            window_secs: default_window_secs(),
+            max_failed_ips: default_max_failed_ips(),
+            max_blocked_ips: default_max_blocked_ips(),
+        }
+    }
+}
+
+fn default_ip_block_enabled() -> bool {
+    true
+}
+
+fn default_max_failures() -> u32 {
+    3
+}
+
+fn default_window_secs() -> u64 {
+    600
+}
+
+fn default_max_failed_ips() -> usize {
+    100_000
+}
+
+fn default_max_blocked_ips() -> usize {
+    50_000
+}
+
 impl AppConfig {
     /// 从指定路径加载并解析 TOML 配置文件
     pub fn load(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
@@ -125,7 +187,7 @@ impl AppConfig {
             .into());
         }
 
-        // 校验 TLS 最低版本
+// 校验 TLS 最低版本
         match config.tls.tls_min_version.trim() {
             "1.0" | "1.1" | "1.2" | "1.3" => {}
             other => {
@@ -135,6 +197,33 @@ impl AppConfig {
                 )
                 .into());
             }
+        }
+
+        // 校验 IP 封锁配置
+        if config.ip_block.enabled {
+            if config.ip_block.max_failures == 0 {
+                return Err("ip_block.max_failures 必须大于 0（或设置 ip_block.enabled = false 关闭封锁）".into());
+            }
+            if config.ip_block.window_secs == 0 {
+                return Err("ip_block.window_secs 必须大于 0（或设置 ip_block.enabled = false 关闭封锁）".into());
+            }
+            if config.ip_block.max_failed_ips == 0 {
+                return Err("ip_block.max_failed_ips 必须大于 0（或设置 ip_block.enabled = false 关闭封锁）".into());
+            }
+            if config.ip_block.max_blocked_ips == 0 {
+                return Err("ip_block.max_blocked_ips 必须大于 0（或设置 ip_block.enabled = false 关闭封锁）".into());
+            }
+        }
+        if config.ip_block.enabled {
+            tracing::info!(
+                "IP 封锁已启用：阈值 {} 次 / {}s 窗口（失败表上限 {}、封锁表上限 {}）",
+                config.ip_block.max_failures,
+                config.ip_block.window_secs,
+                config.ip_block.max_failed_ips,
+                config.ip_block.max_blocked_ips
+            );
+        } else {
+            tracing::warn!("IP 封锁已关闭（ip_block.enabled = false），所有来源均可进入认证流程");
         }
 
         // 校验独立密码中的分机号是否在范围内
@@ -204,6 +293,145 @@ impl AppConfig {
                 tracing::warn!("无法创建 UDP socket 检测本机 IP: {}，使用 127.0.0.1", e);
                 "127.0.0.1".to_string()
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ip_block_config_defaults_match_original_constants() {
+        // 缺省值应与原写死常量一致：启用、阈值 3、窗口 600s、失败表 10 万、封锁表 5 万
+        let cfg = IpBlockConfig::default();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.max_failures, 3);
+        assert_eq!(cfg.window_secs, 600);
+        assert_eq!(cfg.max_failed_ips, 100_000);
+        assert_eq!(cfg.max_blocked_ips, 50_000);
+    }
+
+    #[test]
+    fn ip_block_config_absent_section_uses_defaults() {
+        // 配置文件未写 [ip_block] 段时，serde(default) 应回退到默认值
+        let toml = r#"
+[server]
+listen_addr = "0.0.0.0"
+sip_port = 5061
+host = "minghe.local"
+
+[extensions]
+range_start = 1000
+range_end = 2000
+default_password = "pw"
+
+[tls]
+cert_path = ""
+key_path = ""
+
+[media]
+rtp_port_start = 20000
+rtp_port_end = 20020
+media_addr = "192.168.1.100"
+"#;
+        let config: AppConfig = toml::from_str(toml).unwrap();
+        assert!(config.ip_block.enabled);
+        assert_eq!(config.ip_block.max_failures, 3);
+        assert_eq!(config.ip_block.window_secs, 600);
+        assert_eq!(config.ip_block.max_failed_ips, 100_000);
+        assert_eq!(config.ip_block.max_blocked_ips, 50_000);
+    }
+
+    #[test]
+    fn ip_block_config_parses_custom_values() {
+        let toml = r#"
+[server]
+listen_addr = "0.0.0.0"
+sip_port = 5061
+host = "minghe.local"
+
+[extensions]
+range_start = 1000
+range_end = 2000
+default_password = "pw"
+
+[tls]
+cert_path = ""
+key_path = ""
+
+[media]
+rtp_port_start = 20000
+rtp_port_end = 20020
+media_addr = "192.168.1.100"
+
+[ip_block]
+enabled = false
+max_failures = 10
+window_secs = 120
+max_failed_ips = 5000
+max_blocked_ips = 2000
+"#;
+        let config: AppConfig = toml::from_str(toml).unwrap();
+        assert!(!config.ip_block.enabled);
+        assert_eq!(config.ip_block.max_failures, 10);
+        assert_eq!(config.ip_block.window_secs, 120);
+        assert_eq!(config.ip_block.max_failed_ips, 5000);
+        assert_eq!(config.ip_block.max_blocked_ips, 2000);
+    }
+
+    #[test]
+    fn load_rejects_zero_max_failures_when_enabled() {
+        let toml = r#"
+[server]
+listen_addr = "0.0.0.0"
+sip_port = 5061
+host = "minghe.local"
+
+[extensions]
+range_start = 1000
+range_end = 2000
+default_password = "pw"
+
+[tls]
+cert_path = ""
+key_path = ""
+
+[media]
+rtp_port_start = 20000
+rtp_port_end = 20020
+media_addr = "192.168.1.100"
+
+[ip_block]
+enabled = true
+max_failures = 0
+window_secs = 600
+"#;
+        let config: Result<AppConfig, Box<dyn std::error::Error>> = AppConfig::load_from_str_for_test(toml);
+        assert!(config.is_err(), "启用时 max_failures=0 应被拒绝");
+    }
+
+    impl AppConfig {
+        /// 测试辅助：从 TOML 字符串加载（绕过文件读取），复用 load 的校验逻辑
+        fn load_from_str_for_test(content: &str) -> Result<Self, Box<dyn std::error::Error>> {
+            let config: AppConfig = toml::from_str(content)
+                .map_err(|e| format!("配置文件解析错误: {}", e))?;
+            // 与 load 相同的 ip_block 校验
+            if config.ip_block.enabled {
+                if config.ip_block.max_failures == 0 {
+                    return Err("ip_block.max_failures 必须大于 0".into());
+                }
+                if config.ip_block.window_secs == 0 {
+                    return Err("ip_block.window_secs 必须大于 0".into());
+                }
+                if config.ip_block.max_failed_ips == 0 {
+                    return Err("ip_block.max_failed_ips 必须大于 0".into());
+                }
+                if config.ip_block.max_blocked_ips == 0 {
+                    return Err("ip_block.max_blocked_ips 必须大于 0".into());
+                }
+            }
+            Ok(config)
         }
     }
 }

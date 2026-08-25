@@ -55,6 +55,8 @@ pub struct RegistrarService {
     /// 分机号码范围
     range_start: u32,
     range_end: u32,
+    /// IP 封锁策略（启用开关、阈值、窗口）
+    ip_block: IpBlockPolicy,
     /// IP -> 窗口内失败记录（达到阈值后移入封锁表并移除本表条目）
     failed_ips: RwLock<HashMap<String, FailedIpEntry>>,
     /// 已被封锁的 IP（窗口内累计失败达到阈值，进程生命周期内不解封）
@@ -70,17 +72,64 @@ struct FailedIpEntry {
     window_start: u64,
 }
 
-/// IP 在失败窗口内累计失败达到该次数即被永久封锁
-const MAX_REGISTER_FAILURES: u32 = 3;
+/// 失败计数表（`failed_ips`）默认最大条目数，防止攻击者用海量不同 IP 撑爆内存
+const DEFAULT_MAX_FAILED_IPS: usize = 100_000;
 
-/// 失败计数滑动窗口（秒）：窗口外的失败自动过期，避免合法用户被长期累计误伤
-const FAILURE_WINDOW_SECS: u64 = 600;
+/// 封锁表（`blocked_ips`）默认最大条目数，达到上限后不再新增封锁（内存保护，降级为仅告警）
+const DEFAULT_MAX_BLOCKED_IPS: usize = 50_000;
 
-/// `failed_ips` 表最大条目数，防止攻击者用海量不同 IP 撑爆内存
-const MAX_FAILED_IPS: usize = 100_000;
+/// IP 封锁策略参数（来自配置，而非写死常量）
+#[derive(Debug, Clone, Copy)]
+pub struct IpBlockPolicy {
+    /// 是否启用 IP 封锁
+    pub enabled: bool,
+    /// 封锁阈值：窗口内累计失败达到该次数即封锁
+    pub max_failures: u32,
+    /// 失败计数统计窗口（秒）
+    pub window_secs: u64,
+    /// 失败计数表最大条目数（内存保护上限）
+    pub max_failed_ips: usize,
+    /// 封锁表最大条目数（内存保护上限，达到后降级为仅告警）
+    pub max_blocked_ips: usize,
+}
 
-/// `blocked_ips` 表最大条目数，达到上限后不再新增封锁（内存保护，降级为仅告警）
-const MAX_BLOCKED_IPS: usize = 50_000;
+impl Default for IpBlockPolicy {
+    /// 默认策略：启用、阈值 3 次、窗口 600s（与原写死常量一致）
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_failures: 3,
+            window_secs: 600,
+            max_failed_ips: DEFAULT_MAX_FAILED_IPS,
+            max_blocked_ips: DEFAULT_MAX_BLOCKED_IPS,
+        }
+    }
+}
+
+impl IpBlockPolicy {
+    /// 以"完全关闭"策略创建（用于无配置的测试场景）
+    fn disabled() -> Self {
+        Self {
+            enabled: false,
+            max_failures: u32::MAX,
+            window_secs: 600,
+            max_failed_ips: DEFAULT_MAX_FAILED_IPS,
+            max_blocked_ips: DEFAULT_MAX_BLOCKED_IPS,
+        }
+    }
+}
+
+impl From<&crate::config::IpBlockConfig> for IpBlockPolicy {
+    fn from(cfg: &crate::config::IpBlockConfig) -> Self {
+        Self {
+            enabled: cfg.enabled,
+            max_failures: cfg.max_failures,
+            window_secs: cfg.window_secs,
+            max_failed_ips: cfg.max_failed_ips,
+            max_blocked_ips: cfg.max_blocked_ips,
+        }
+    }
+}
 
 /// 当前 Unix 秒
 fn now_secs() -> u64 {
@@ -92,12 +141,16 @@ fn now_secs() -> u64 {
 
 impl RegistrarService {
     /// 创建新的注册服务
+    ///
+    /// `ip_block` 控制 IP 封锁行为（是否启用、封锁阈值、统计窗口），
+    /// 通常由 [crate::config::IpBlockConfig] 转换而来。
     pub fn new(
         domain: String,
         default_password: String,
         passwords: HashMap<String, String>,
         range_start: u32,
         range_end: u32,
+        ip_block: IpBlockPolicy,
     ) -> Self {
         if !passwords.is_empty() {
             tracing::info!("已配置 {} 个分机独立密码", passwords.len());
@@ -109,6 +162,7 @@ impl RegistrarService {
             passwords,
             range_start,
             range_end,
+            ip_block,
             failed_ips: RwLock::new(HashMap::new()),
             blocked_ips: RwLock::new(HashSet::new()),
         }
@@ -117,33 +171,49 @@ impl RegistrarService {
     /// 检查指定 IP 是否已被封锁
     ///
     /// `pub(crate)`：供 [Router] 在 INVITE 等其它方法上复用同一封锁表。
+    /// IP 封锁关闭时始终返回 `false`。
     pub(crate) fn is_blocked(&self, ip: &str) -> bool {
+        if !self.ip_block.enabled {
+            return false;
+        }
         self.blocked_ips.read().unwrap().contains(ip)
     }
 
     /// 记录一次失败（注册、认证或未认证呼叫探测）；窗口内累计达到阈值后封锁该 IP 并返回 `true`
     ///
-    /// 失败计数使用滑动窗口（[FAILURE_WINDOW_SECS]）：窗口外的失败自动过期，
+    /// 失败计数使用滑动窗口（`ip_block.window_secs`）：窗口外的失败自动过期，
     /// 避免合法用户因历史偶发失败被永久累计误伤。窗口内累计达到阈值后，该 IP
     /// 被移入封锁表（进程生命周期内不解封）。
     ///
-    /// 两张表均有容量上限（[MAX_FAILED_IPS] / [MAX_BLOCKED_IPS]），防止攻击者
+    /// IP 封锁关闭（`ip_block.enabled = false`）时，本方法为空操作：不计数、
+    /// 不封锁，始终返回 `false`，所有来源均放行进入认证流程。
+    ///
+    /// 两张表均有容量上限（`ip_block.max_failed_ips` / `ip_block.max_blocked_ips`），防止攻击者
     /// 用海量不同 IP 撑爆内存；达到上限时优先清理过期条目，仍满则清空失败表
     /// 或拒绝新增封锁并告警（降级为仅限流，不崩溃）。
     ///
     /// `pub(crate)`：供 [Router] 在 INVITE 等其它方法上复用同一失败计数。
     pub(crate) fn record_failure(&self, ip: &str) -> bool {
+        // IP 封锁关闭：不计数、不封锁，直接放行
+        if !self.ip_block.enabled {
+            return false;
+        }
+
         let now = now_secs();
+        let window_secs = self.ip_block.window_secs;
+        let max_failures = self.ip_block.max_failures;
+        let max_failed_ips = self.ip_block.max_failed_ips;
+        let max_blocked_ips = self.ip_block.max_blocked_ips;
         {
             let mut failed = self.failed_ips.write().unwrap();
 
             // 容量上限：先清理窗口过期条目，仍超限则清空失败表（丢计数换取内存安全）
-            if failed.len() >= MAX_FAILED_IPS {
-                failed.retain(|_, e| now.saturating_sub(e.window_start) < FAILURE_WINDOW_SECS);
-                if failed.len() >= MAX_FAILED_IPS {
+            if failed.len() >= max_failed_ips {
+                failed.retain(|_, e| now.saturating_sub(e.window_start) < window_secs);
+                if failed.len() >= max_failed_ips {
                     tracing::warn!(
                         "failed_ips 表超过上限 ({} 条) 且无过期条目可清理，清空失败表以保护内存",
-                        MAX_FAILED_IPS
+                        max_failed_ips
                     );
                     failed.clear();
                 }
@@ -154,21 +224,21 @@ impl RegistrarService {
                 window_start: now,
             });
             // 窗口过期：重置计数，重新开始窗口
-            if now.saturating_sub(entry.window_start) >= FAILURE_WINDOW_SECS {
+            if now.saturating_sub(entry.window_start) >= window_secs {
                 entry.count = 0;
                 entry.window_start = now;
             }
             entry.count += 1;
             let count = entry.count;
 
-            if count < MAX_REGISTER_FAILURES {
+            if count < max_failures {
                 tracing::warn!(
                     ip = %ip,
                     "认证/呼叫失败 {}/{}（{}s 窗口内达到 {} 次将封锁）",
                     count,
-                    MAX_REGISTER_FAILURES,
-                    FAILURE_WINDOW_SECS,
-                    MAX_REGISTER_FAILURES
+                    max_failures,
+                    window_secs,
+                    max_failures
                 );
                 return false;
             }
@@ -178,11 +248,11 @@ impl RegistrarService {
         }
 
         let mut blocked = self.blocked_ips.write().unwrap();
-        if blocked.len() >= MAX_BLOCKED_IPS {
+        if blocked.len() >= max_blocked_ips {
             tracing::warn!(
                 ip = %ip,
                 "blocked_ips 表已满 ({} 条)，拒绝新增封锁（内存保护降级）",
-                MAX_BLOCKED_IPS
+                max_blocked_ips
             );
             return false;
         }
@@ -190,7 +260,7 @@ impl RegistrarService {
         tracing::warn!(
             ip = %ip,
             "认证/呼叫失败累计 {} 次，已永久封锁该 IP",
-            MAX_REGISTER_FAILURES
+            max_failures
         );
         true
     }
@@ -729,6 +799,7 @@ mod tests {
             HashMap::new(),
             1000,
             2000,
+            IpBlockPolicy::default(),
         );
         let from: SocketAddr = "203.0.113.9:5061".parse().unwrap();
 
@@ -777,6 +848,7 @@ mod tests {
             HashMap::new(),
             1000,
             2000,
+            IpBlockPolicy::default(),
         );
         // 同一 IP 不同端口（攻击者高频换端口）累计失败同样封禁该 IP
         for port in [5061u16, 5300, 5500] {
@@ -803,6 +875,7 @@ mod tests {
             HashMap::new(),
             1000,
             2000,
+            IpBlockPolicy::default(),
         );
         let from: SocketAddr = "203.0.113.30:5061".parse().unwrap();
 
@@ -856,6 +929,7 @@ mod tests {
             HashMap::new(),
             1000,
             2000,
+            IpBlockPolicy::default(),
         );
         // 2 次失败（count=2），随后直接把窗口起点拨到窗口外
         for i in 0..2 {
@@ -866,7 +940,7 @@ mod tests {
             let mut failed = registrar.failed_ips.write().unwrap();
             if let Some(entry) = failed.get_mut("203.0.113.40") {
                 entry.window_start =
-                    now_secs().saturating_sub(FAILURE_WINDOW_SECS + 1);
+                    now_secs().saturating_sub(registrar.ip_block.window_secs + 1);
             }
         }
         // 窗口外的历史失败不参与累计：再失败 2 次也不应封锁
@@ -877,18 +951,27 @@ mod tests {
 
     #[test]
     fn failed_table_respects_capacity_cap() {
+        // 用小容量验证失败表上限保护（避免填满 10 万条）
         let registrar = RegistrarService::new(
             "example.com".to_string(),
             "pw".to_string(),
             HashMap::new(),
             1000,
             2000,
+            IpBlockPolicy {
+                enabled: true,
+                max_failures: 3,
+                window_secs: 600,
+                max_failed_ips: 4,
+                max_blocked_ips: 50_000,
+            },
         );
         // 填满失败表（模拟扫描器海量不同 IP）
         let now = now_secs();
+        let cap = registrar.ip_block.max_failed_ips;
         {
             let mut failed = registrar.failed_ips.write().unwrap();
-            for i in 0..MAX_FAILED_IPS {
+            for i in 0..cap {
                 failed.insert(
                     format!("198.51.{}.{}", (i >> 8) % 256, i % 256),
                     FailedIpEntry {
@@ -901,7 +984,7 @@ mod tests {
         // 表已满且无过期条目：record_failure 应清空表并正常计数，不死锁/不 panic
         assert!(!registrar.record_failure("203.0.113.50"));
         let len = registrar.failed_ips.read().unwrap().len();
-        assert!(len < MAX_FAILED_IPS, "超限后应清理失败表, got {len}");
+        assert!(len < cap, "超限后应清理失败表, got {len}");
         // 清理后新 IP 仍能正常累计并封锁
         for _ in 0..2 {
             registrar.record_failure("203.0.113.50");
@@ -911,22 +994,118 @@ mod tests {
 
     #[test]
     fn blocked_table_respects_capacity_cap() {
+        // 用小容量验证封锁表上限保护（避免填满 5 万条）
         let registrar = RegistrarService::new(
             "example.com".to_string(),
             "pw".to_string(),
             HashMap::new(),
             1000,
             2000,
+            IpBlockPolicy {
+                enabled: true,
+                max_failures: 3,
+                window_secs: 600,
+                max_failed_ips: 100_000,
+                max_blocked_ips: 4,
+            },
         );
         // 直接填满封锁表
+        let cap = registrar.ip_block.max_blocked_ips;
         {
             let mut blocked = registrar.blocked_ips.write().unwrap();
-            for i in 0..MAX_BLOCKED_IPS {
+            for i in 0..cap {
                 blocked.insert(format!("198.51.{}.{}", (i >> 8) % 256, i % 256));
             }
         }
         // 表满后新增封锁被拒绝（内存保护降级），不 panic
         assert!(!registrar.record_failure("203.0.113.60"));
         assert!(!registrar.is_blocked("203.0.113.60"));
+    }
+
+    #[test]
+    fn ip_block_disabled_never_blocks_or_counts() {
+        // 关闭 IP 封锁：无论失败多少次都不应封锁，也不累计计数
+        let registrar = RegistrarService::new(
+            "example.com".to_string(),
+            "pw".to_string(),
+            HashMap::new(),
+            1000,
+            2000,
+            IpBlockPolicy::disabled(),
+        );
+        for _ in 0..100 {
+            assert!(!registrar.record_failure("203.0.113.77"));
+        }
+        assert!(!registrar.is_blocked("203.0.113.77"));
+        // 失败表不应产生任何条目（record_failure 在禁用时直接返回）
+        assert!(registrar.failed_ips.read().unwrap().is_empty());
+
+        // 禁用状态下，is_blocked 对已手动写入封锁表的 IP 也返回 false
+        {
+            registrar
+                .blocked_ips
+                .write()
+                .unwrap()
+                .insert("203.0.113.77".to_string());
+        }
+        assert!(!registrar.is_blocked("203.0.113.77"));
+    }
+
+    #[test]
+    fn ip_block_respects_custom_threshold() {
+        // 自定义阈值 5 次：前 4 次不封锁，第 5 次封锁
+        let registrar = RegistrarService::new(
+            "example.com".to_string(),
+            "pw".to_string(),
+            HashMap::new(),
+            1000,
+            2000,
+            IpBlockPolicy {
+                enabled: true,
+                max_failures: 5,
+                window_secs: 600,
+                max_failed_ips: 100_000,
+                max_blocked_ips: 50_000,
+            },
+        );
+        for _ in 0..4 {
+            assert!(!registrar.record_failure("203.0.113.88"));
+        }
+        assert!(!registrar.is_blocked("203.0.113.88"), "4 次失败不应封锁");
+        assert!(registrar.record_failure("203.0.113.88"), "第 5 次失败应触发封锁");
+        assert!(registrar.is_blocked("203.0.113.88"));
+    }
+
+    #[test]
+    fn ip_block_respects_custom_window() {
+        // 自定义窗口 60s：把窗口起点拨到 61s 前应使历史失败过期
+        let registrar = RegistrarService::new(
+            "example.com".to_string(),
+            "pw".to_string(),
+            HashMap::new(),
+            1000,
+            2000,
+            IpBlockPolicy {
+                enabled: true,
+                max_failures: 3,
+                window_secs: 60,
+                max_failed_ips: 100_000,
+                max_blocked_ips: 50_000,
+            },
+        );
+        // 2 次失败后拨到窗口外
+        for _ in 0..2 {
+            registrar.record_failure("203.0.113.99");
+        }
+        {
+            let mut failed = registrar.failed_ips.write().unwrap();
+            if let Some(entry) = failed.get_mut("203.0.113.99") {
+                entry.window_start = now_secs().saturating_sub(registrar.ip_block.window_secs + 1);
+            }
+        }
+        // 窗口外的历史失败不参与累计：再失败 2 次也不应封锁
+        assert!(!registrar.record_failure("203.0.113.99"));
+        assert!(!registrar.record_failure("203.0.113.99"));
+        assert!(!registrar.is_blocked("203.0.113.99"));
     }
 }
