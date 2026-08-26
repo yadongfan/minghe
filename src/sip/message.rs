@@ -1,4 +1,4 @@
-//!
+﻿//!
 //! 处理 MESSAGE 请求（分机间即时消息）：
 //! 在线转发、离线暂存、注册上线后自动补投。
 //!
@@ -8,7 +8,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::mpsc;
+use tokio::net::UdpSocket;
 
 use super::parser;
 use super::registrar::RegistrarService;
@@ -16,6 +16,10 @@ use super::router::{
     build_outbound_request_with_from, extract_called_extension, registered_contact_uri,
     server_contact_uri,
 };
+use super::transport::{ConnectionSink, Transport};
+
+#[cfg(test)]
+use tokio::sync::mpsc;
 
 /// 单条 MESSAGE 消息体最大字节数（防滥用，SIP over TCP 可承载更大消息）
 const MAX_MESSAGE_BODY_LEN: usize = 4096;
@@ -102,8 +106,10 @@ pub struct MessageService {
     registrar: Arc<RegistrarService>,
     /// 服务器域名
     domain: String,
-    /// 连接映射：分机号 -> 写入通道（与 Router 共享，由 server 模块更新）
-    connection_writers: Arc<RwLock<HashMap<String, mpsc::Sender<Vec<u8>>>>>,
+    /// 连接映射：分机号 -> 发送出口（与 Router 共享，由 server 模块更新）
+    connection_writers: Arc<RwLock<HashMap<String, ConnectionSink>>>,
+    /// 明文 UDP 信令 socket（未启用时为 None），用于向 UDP 分机转发/补投消息
+    udp_socket: Option<Arc<UdpSocket>>,
     /// 分机号码范围（校验 MESSAGE 目标合法性）
     range_start: u32,
     range_end: u32,
@@ -118,14 +124,16 @@ impl MessageService {
     pub fn new(
         registrar: Arc<RegistrarService>,
         domain: String,
-        connection_writers: Arc<RwLock<HashMap<String, mpsc::Sender<Vec<u8>>>>>,
+        connection_writers: Arc<RwLock<HashMap<String, ConnectionSink>>>,
         range_start: u32,
         range_end: u32,
+        udp_socket: Option<Arc<UdpSocket>>,
     ) -> Self {
         Self {
             registrar,
             domain,
             connection_writers,
+            udp_socket,
             range_start,
             range_end,
             offline_messages: RwLock::new(HashMap::new()),
@@ -133,13 +141,26 @@ impl MessageService {
         }
     }
 
-    /// 获取分机的写入通道
-    fn get_writer(&self, extension: &str) -> Option<mpsc::Sender<Vec<u8>>> {
+    /// 获取分机的发送出口
+    ///
+    /// 优先取已注册的持久连接出口（TLS）；未找到时若分机以明文 UDP 注册，
+    /// 则按注册表最新来源地址动态构造 UDP 出口。
+    fn get_outbound(&self, extension: &str) -> Option<ConnectionSink> {
         let writers = self
             .connection_writers
             .read()
             .expect("connection_writers 锁中毒");
-        writers.get(extension).cloned()
+        if let Some(sink) = writers.get(extension).cloned() {
+            return Some(sink);
+        }
+        if let Some(socket) = &self.udp_socket {
+            if let Some(reg) = self.registrar.lookup(extension) {
+                if reg.transport == Transport::Udp {
+                    return Some(ConnectionSink::Udp(socket.clone(), reg.transport_addr));
+                }
+            }
+        }
+        None
     }
 
     /// 检查分机号是否在有效号码范围内
@@ -214,17 +235,19 @@ impl MessageService {
         );
 
         // 被叫在线：直接转发
-        if let Some(writer) = self.get_writer(&callee_ext) {
+        if let Some(sink) = self.get_outbound(&callee_ext) {
             let target_uri = registered_contact_uri(&callee_ext, &self.domain, &self.registrar);
             // 重写 From 为认证主叫（防止伪造 From 冒名），Contact 指向本服务
+            let transport = sink.transport();
             let forwarded = build_outbound_request_with_from(
                 request_text,
                 &target_uri,
                 &self.domain,
-                &server_contact_uri(from_ext, &self.domain),
-                &server_contact_uri(from_ext, &self.domain),
+                &server_contact_uri(from_ext, &self.domain, transport),
+                &server_contact_uri(from_ext, &self.domain, transport),
+                transport,
             );
-            match writer.send(forwarded.into_bytes()).await {
+            match sink.send(forwarded.into_bytes()).await {
                 Ok(_) => {
                     tracing::info!("MESSAGE 已投递给在线分机 {}", callee_ext);
                     return parser::build_response(request_text, 200, "OK");
@@ -389,7 +412,7 @@ impl MessageService {
         }
 
         // 分机未在线（例如注册后连接立即断开），把消息放回队列
-        let Some(writer) = self.get_writer(extension) else {
+        let Some(sink) = self.get_outbound(extension) else {
             tracing::warn!(
                 "分机 {} 注册后无可用连接，离线消息保留待下次投递",
                 extension
@@ -405,6 +428,7 @@ impl MessageService {
         };
 
         let target_uri = registered_contact_uri(extension, &self.domain, &self.registrar);
+        let transport = sink.transport();
         let mut pending: VecDeque<OfflineMessage> = messages.into();
         let mut delivered = 0usize;
         while let Some(msg) = pending.pop_front() {
@@ -419,10 +443,11 @@ impl MessageService {
                 &msg.original_request,
                 &target_uri,
                 &self.domain,
-                &server_contact_uri(&msg.from_ext, &self.domain),
-                &server_contact_uri(&msg.from_ext, &self.domain),
+                &server_contact_uri(&msg.from_ext, &self.domain, transport),
+                &server_contact_uri(&msg.from_ext, &self.domain, transport),
+                transport,
             );
-            match writer.send(forwarded.into_bytes()).await {
+            match sink.send(forwarded.into_bytes()).await {
                 Ok(_) => delivered += 1,
                 Err(e) => {
                     tracing::error!(
@@ -453,10 +478,10 @@ impl MessageService {
 mod tests {
     use super::*;
 
-    /// 创建测试服务：返回服务实例与共享的写入通道映射
+    /// 创建测试服务：返回服务实例与共享的发送出口映射
     fn test_service() -> (
         Arc<MessageService>,
-        Arc<RwLock<HashMap<String, mpsc::Sender<Vec<u8>>>>>,
+        Arc<RwLock<HashMap<String, ConnectionSink>>>,
     ) {
         let registrar = Arc::new(RegistrarService::new(
             "example.com".to_string(),
@@ -465,6 +490,7 @@ mod tests {
             1000,
             2000,
             crate::sip::registrar::IpBlockPolicy::default(),
+            Vec::new(),
         ));
         let writers = Arc::new(RwLock::new(HashMap::new()));
         let svc = Arc::new(MessageService::new(
@@ -473,6 +499,7 @@ mod tests {
             Arc::clone(&writers),
             1000,
             2000,
+            None,
         ));
         (svc, writers)
     }
@@ -553,7 +580,10 @@ mod tests {
     async fn message_forwards_to_online_callee() {
         let (svc, writers) = test_service();
         let (tx, mut rx) = mpsc::channel(8);
-        writers.write().unwrap().insert("1002".to_string(), tx);
+        writers
+            .write()
+            .unwrap()
+            .insert("1002".to_string(), ConnectionSink::Stream(tx));
 
         let msg = build_message("1001", "1002", "hello online");
         let resp = svc.handle_message(&msg, "1001").await;
@@ -577,7 +607,10 @@ mod tests {
     async fn message_rewrites_forged_from_header() {
         let (svc, writers) = test_service();
         let (tx, mut rx) = mpsc::channel(8);
-        writers.write().unwrap().insert("1002".to_string(), tx);
+        writers
+            .write()
+            .unwrap()
+            .insert("1002".to_string(), ConnectionSink::Stream(tx));
 
         // 伪造 From 为 1999，认证主叫是 1001：转发时 From 必须被重写为 1001
         let forged = format!(
@@ -700,7 +733,10 @@ mod tests {
 
         // 模拟 1002 注册上线
         let (tx, mut rx) = mpsc::channel(8);
-        writers.write().unwrap().insert("1002".to_string(), tx);
+        writers
+            .write()
+            .unwrap()
+            .insert("1002".to_string(), ConnectionSink::Stream(tx));
         svc.deliver_offline_messages("1002").await;
 
         let delivered = rx.try_recv().expect("上线后应收到补投消息");
@@ -723,7 +759,10 @@ mod tests {
         // 写入通道接收端已关闭：send 必然失败
         let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
         drop(rx);
-        writers.write().unwrap().insert("1002".to_string(), tx);
+        writers
+            .write()
+            .unwrap()
+            .insert("1002".to_string(), ConnectionSink::Stream(tx));
         svc.deliver_offline_messages("1002").await;
 
         // 未送达的消息应写回队列，等待下次投递，而不是丢失
@@ -759,6 +798,93 @@ mod tests {
         // 最旧的被丢弃，最新保留
         assert!(queue.back().unwrap().original_request.contains("msg 109"));
         assert!(!queue.front().unwrap().original_request.contains("msg 0"));
+    }
+
+    #[tokio::test]
+    async fn message_forwards_to_udp_callee_via_sink() {
+        use tokio::net::UdpSocket;
+
+        let (svc, writers) = test_service();
+        let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client_sock.local_addr().unwrap();
+        writers.write().unwrap().insert(
+            "1002".to_string(),
+            ConnectionSink::Udp(server_sock, client_addr),
+        );
+
+        let msg = build_message("1001", "1002", "hello udp");
+        let resp = svc.handle_message(&msg, "1001").await;
+        assert!(String::from_utf8(resp)
+            .unwrap()
+            .starts_with("SIP/2.0 200 OK"));
+
+        // UDP 对端收到转发消息：Via 与 Contact 均应为 udp
+        let mut buf = [0u8; 4096];
+        let (len, _) = client_sock.recv_from(&mut buf).await.unwrap();
+        let fwd = String::from_utf8(buf[..len].to_vec()).unwrap();
+        assert!(fwd.starts_with("MESSAGE sip:1002@"));
+        assert!(fwd.contains("Via: SIP/2.0/UDP example.com;branch=z9hG4bK"));
+        assert!(fwd.contains("Contact: <sip:1001@example.com;transport=udp>\r\n"));
+        assert!(fwd.contains("hello udp"));
+        assert!(svc.offline_messages.read().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn message_forwards_to_registered_udp_callee_without_writer() {
+        use std::net::SocketAddr;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tokio::net::UdpSocket;
+
+        use crate::sip::registrar::Registration;
+
+        // 服务持有 udp_socket，被叫 1002 以 UDP 注册但无持久 writer
+        let registrar = Arc::new(RegistrarService::new(
+            "example.com".to_string(),
+            "pw".to_string(),
+            HashMap::new(),
+            1000,
+            2000,
+            crate::sip::registrar::IpBlockPolicy::default(),
+            vec!["1002".to_string()],
+        ));
+        let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let writers = Arc::new(RwLock::new(HashMap::new()));
+        let svc = Arc::new(MessageService::new(
+            registrar.clone(),
+            "example.com".to_string(),
+            Arc::clone(&writers),
+            1000,
+            2000,
+            Some(server_sock),
+        ));
+        let from: SocketAddr = client_sock.local_addr().unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        registrar.register(Registration {
+            extension: "1002".to_string(),
+            contact: "sip:1002@example.com;transport=udp".to_string(),
+            expires_at: now + 3600,
+            transport_addr: from,
+            transport: Transport::Udp,
+        });
+
+        let msg = build_message("1001", "1002", "hi fallback");
+        let resp = svc.handle_message(&msg, "1001").await;
+        assert!(String::from_utf8(resp)
+            .unwrap()
+            .starts_with("SIP/2.0 200 OK"));
+
+        let mut buf = [0u8; 4096];
+        let (len, _) = client_sock.recv_from(&mut buf).await.unwrap();
+        let fwd = String::from_utf8(buf[..len].to_vec()).unwrap();
+        assert!(fwd.contains("Via: SIP/2.0/UDP example.com;branch=z9hG4bK"));
+        assert!(fwd.contains("Contact: <sip:1001@example.com;transport=udp>\r\n"));
+        assert!(fwd.contains("hi fallback"));
+        assert!(svc.offline_messages.read().unwrap().is_empty());
     }
 
     /// 构造一条测试用的离线消息（TTL 判断不依赖 received_at，可传任意值）
@@ -823,7 +949,10 @@ mod tests {
         }
 
         let (tx, mut rx) = mpsc::channel(8);
-        writers.write().unwrap().insert("1002".to_string(), tx);
+        writers
+            .write()
+            .unwrap()
+            .insert("1002".to_string(), ConnectionSink::Stream(tx));
         svc.deliver_offline_messages("1002").await;
 
         // 只有未过期的 fresh 被投递，过期 stale 被丢弃

@@ -36,6 +36,26 @@ pub struct ServerConfig {
     /// 用于 SIP URI 和 TLS 证书生成
     /// 支持域名（如 "minghe.local"）和 IP 地址（如 "192.168.1.100"）
     pub host: String,
+    /// 是否启用明文 UDP 信令（默认 false）
+    ///
+    /// 启用后仅在 `insecure_extensions` 白名单内的分机允许通过 UDP 注册，
+    /// 白名单外分机从 UDP 注册将被拒绝（403）。媒体始终为 SRTP/UDP，不受影响。
+    #[serde(default)]
+    pub insecure_enabled: bool,
+    /// 明文 UDP 信令端口（默认 5060）
+    #[serde(default = "default_insecure_port")]
+    pub insecure_port: u16,
+    /// 允许使用明文 UDP 信令的分机白名单
+    ///
+    /// `insecure_enabled = true` 时生效；列表为空表示全部拒绝（安全默认）。
+    /// 分机号必须是 `range_start` ~ `range_end` 范围内的数字。
+    #[serde(default)]
+    pub insecure_extensions: Vec<String>,
+}
+
+/// 明文 UDP 信令端口默认值（SIP 标准端口）
+fn default_insecure_port() -> u16 {
+    5060
 }
 
 impl ServerConfig {
@@ -163,6 +183,14 @@ impl AppConfig {
             .into());
         }
 
+        if config.server.insecure_enabled && config.server.insecure_port == config.server.sip_port {
+            return Err(format!(
+                "端口冲突: insecure_port ({}) 与 sip_port ({}) 相同，明文 UDP 与 TLS 不能共用一个端口",
+                config.server.insecure_port, config.server.sip_port
+            )
+            .into());
+        }
+
         if config.media.rtp_port_start > config.media.rtp_port_end {
             return Err(format!(
                 "RTP 端口范围无效: rtp_port_start ({}) > rtp_port_end ({})",
@@ -247,6 +275,41 @@ impl AppConfig {
 
         if !config.passwords.is_empty() {
             tracing::info!("已加载 {} 个分机独立密码配置", config.passwords.len());
+        }
+
+        // 校验明文 UDP 白名单
+        if config.server.insecure_enabled {
+            for ext in &config.server.insecure_extensions {
+                if let Ok(ext_num) = ext.parse::<u32>() {
+                    if ext_num < config.extensions.range_start
+                        || ext_num > config.extensions.range_end
+                    {
+                        tracing::warn!(
+                            "明文 UDP 白名单中的分机 {} 不在有效范围 {}-{} 内，该分机的 UDP 注册将被拒绝",
+                            ext,
+                            config.extensions.range_start,
+                            config.extensions.range_end
+                        );
+                    }
+                } else {
+                    return Err(format!(
+                        "明文 UDP 白名单中的分机号 '{}' 格式无效（应为数字）",
+                        ext
+                    )
+                    .into());
+                }
+            }
+            if config.server.insecure_extensions.is_empty() {
+                tracing::warn!(
+                    "已启用明文 UDP 信令但白名单为空，所有分机的 UDP 注册都将被拒绝（安全默认）"
+                );
+            } else {
+                tracing::info!(
+                    "明文 UDP 信令已启用（端口 {}），白名单分机: {}",
+                    config.server.insecure_port,
+                    config.server.insecure_extensions.join(", ")
+                );
+            }
         }
 
         Ok(config)

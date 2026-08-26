@@ -764,15 +764,15 @@ pub fn rewrite_sdp_with_cryptos(
                 result.push(line.to_string());
             }
         } else {
-            if has_crypto && should_strip_for_sdes_srtp(line) {
-                continue;
-            }
-
             if in_audio && line.starts_with("a=crypto") {
                 if !crypto_inserted {
                     push_crypto_lines(&mut result, cryptos);
                     crypto_inserted = true;
                 }
+                continue;
+            }
+
+            if has_crypto && should_strip_for_sdes_srtp(line) {
                 continue;
             }
             result.push(line.to_string());
@@ -799,6 +799,9 @@ fn push_crypto_lines(result: &mut Vec<String>, cryptos: &[SdpCrypto]) {
 
 fn should_strip_for_sdes_srtp(line: &str) -> bool {
     let lower = line.trim().to_ascii_lowercase();
+    // 注意：a=crypto: 在 audio 段内由 rewrite_sdp_with_cryptos 的专门分支处理
+    // （注入新 crypto 后跳过旧行），不会到达这里。此处只剥离 session-level
+    // 的 a=crypto:（位于 m=audio 之前，非 audio 段），这些不会由专门分支处理。
     matches!(
         lower.as_str(),
         value

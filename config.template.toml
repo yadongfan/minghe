@@ -16,6 +16,19 @@ listen_addr = "0.0.0.0"
 # SIP TLS 端口 (SIPS 标准端口)
 sip_port = 5061
 
+# [可选] 明文 UDP 信令（默认关闭，保持纯 TLS）
+# 部分老旧终端不支持 TLS，仅能通过明文 UDP 注册。
+# 启用后仅白名单分机允许 UDP 注册（白名单外分机的 UDP 注册将被拒绝），
+# 其余分机仍强制 TLS。媒体始终为 SRTP/UDP，不受影响。
+#
+# ⚠️ 安全提醒：明文 UDP 下信令（含 Digest 口令挑战）不加密，
+# 仅建议为无法更换的个别终端开放，并务必只列最小白名单。
+insecure_enabled = false
+# 明文 UDP 信令端口（SIP over UDP 标准端口为 5060；不能与 sip_port 相同）
+insecure_port = 5060
+# 允许明文 UDP 注册的分机白名单（为空 = 全部拒绝，安全默认）
+insecure_extensions = []
+
 # [必填] 服务器域名或 IP 地址
 # 用于 SIP URI、TLS 证书生成和 Digest 认证的 realm
 # 示例:

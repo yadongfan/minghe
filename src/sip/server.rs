@@ -1,20 +1,25 @@
-//! SIP TLS 服务器模块
+﻿//! SIP TLS 服务器模块
 //!
 //! 核心服务器循环：TLS 监听 → 消息帧分界 → 解析分发 → 响应回写。
 //! 每个连接维护独立的读写任务，通过 mpsc 通道解耦。
+//!
+//! 可选支持明文 UDP 信令（仅白名单分机），UDP 数据报直接按
+//! [Transport::Udp] 处理，响应回写至数据报来源地址。
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::mpsc;
 
 use super::parser;
 use super::registrar::RegistrarService;
 use super::router::Router;
 use super::transaction::TransactionManager;
+use super::transport::{ConnectionSink, Transport};
 use crate::config::AppConfig;
 use crate::media::relay::MediaRelayManager;
 use crate::tls::ReloadableTlsAcceptor;
@@ -25,8 +30,8 @@ struct ConnectionState {
     peer_addr: SocketAddr,
     /// 已认证的分机号
     extension: Option<String>,
-    /// 写入通道（向客户端发送数据）
-    writer_tx: mpsc::Sender<Vec<u8>>,
+    /// 发送出口（TLS 流写入通道或 UDP 数据报）
+    sink: ConnectionSink,
 }
 
 /// 服务器共享状态
@@ -40,26 +45,26 @@ pub struct ServerState {
 }
 
 impl ServerState {
-    /// 根据分机号查找写入通道
-    fn find_writer_by_extension(&self, ext: &str) -> Option<mpsc::Sender<Vec<u8>>> {
+    /// 根据分机号查找发送出口
+    fn find_sink_by_extension(&self, ext: &str) -> Option<ConnectionSink> {
         let conns = self.connections.read().unwrap();
         for conn in conns.values() {
             if conn.extension.as_deref() == Some(ext) {
-                return Some(conn.writer_tx.clone());
+                return Some(conn.sink.clone());
             }
         }
         None
     }
 
     /// 注册连接
-    fn register_connection(&self, peer_addr: SocketAddr, writer_tx: mpsc::Sender<Vec<u8>>) {
+    fn register_connection(&self, peer_addr: SocketAddr, sink: ConnectionSink) {
         let mut conns = self.connections.write().unwrap();
         conns.insert(
             peer_addr,
             ConnectionState {
                 peer_addr,
                 extension: None,
-                writer_tx,
+                sink,
             },
         );
     }
@@ -80,6 +85,14 @@ impl ServerState {
         }
     }
 
+    /// 检查是否仍有其他连接关联到指定分机
+    fn has_connection_for_extension(&self, ext: &str) -> bool {
+        let conns = self.connections.read().unwrap();
+        conns
+            .values()
+            .any(|conn| conn.extension.as_deref() == Some(ext))
+    }
+
     /// 获取连接的分机号
     fn get_connection_extension(&self, peer_addr: &SocketAddr) -> Option<String> {
         let conns = self.connections.read().unwrap();
@@ -94,11 +107,14 @@ impl ServerState {
 }
 
 /// 启动 SIP TLS 服务器
+///
+/// `udp_socket`：启用明文 UDP 信令时的共享 UDP socket（`None` = 纯 TLS 模式）。
 pub async fn run(
     config: Arc<AppConfig>,
     tls_acceptor: ReloadableTlsAcceptor,
     registrar: Arc<RegistrarService>,
     media_manager: Arc<MediaRelayManager>,
+    udp_socket: Option<Arc<UdpSocket>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let media_addr = config.get_media_addr();
     let router = Arc::new(Router::new(
@@ -108,6 +124,7 @@ pub async fn run(
         media_addr,
         config.extensions.range_start,
         config.extensions.range_end,
+        udp_socket.clone(),
     ));
 
     let transaction_mgr = Arc::new(TransactionManager::new());
@@ -120,6 +137,26 @@ pub async fn run(
         transaction_mgr,
         connections: RwLock::new(HashMap::new()),
     });
+
+    // 明文 UDP 信令：启动数据报监听与会话清理任务
+    if let Some(socket) = udp_socket {
+        let local = match socket.local_addr() {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::error!("无法获取 UDP socket 本地地址: {}", e);
+                return Err(e.into());
+            }
+        };
+        tracing::info!("明文 UDP 信令已启用，监听 {}", local);
+        let udp_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            run_udp_listener(socket, udp_state).await;
+        });
+        let cleanup_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            udp_session_cleanup_loop(cleanup_state).await;
+        });
+    }
 
     let bind_addr = format!("{}:{}", config.server.listen_addr, config.server.sip_port);
     let listener = TcpListener::bind(&bind_addr).await?;
@@ -148,6 +185,59 @@ pub async fn run(
     }
 }
 
+/// 明文 UDP 数据报监听循环
+///
+/// 一个 UDP datagram 视为一条完整 SIP 消息（SIP over UDP），
+/// 响应回写至数据报来源地址；空数据报按 keepalive 忽略。
+async fn run_udp_listener(socket: Arc<UdpSocket>, state: Arc<ServerState>) {
+    let mut buf = vec![0u8; 65536];
+    loop {
+        match socket.recv_from(&mut buf).await {
+            Ok((len, peer_addr)) => {
+                let Ok(msg_text) = std::str::from_utf8(&buf[..len]) else {
+                    tracing::warn!("收到非 UTF-8 UDP 消息 来自 {}", peer_addr);
+                    continue;
+                };
+                let sink = ConnectionSink::Udp(Arc::clone(&socket), peer_addr);
+                process_sip_message(msg_text, peer_addr, sink, Transport::Udp, &state).await;
+            }
+            Err(e) => {
+                tracing::error!("UDP 接收错误: {}", e);
+                // 短暂退避后继续，避免 socket 异常时忙循环
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+}
+
+/// UDP 会话清理循环
+///
+/// UDP 无连接生命周期，过期/未认证的会话不会自然断开；
+/// 定期清理已无有效注册的 UDP 会话条目（TLS 连接由关闭事件自行清理）。
+async fn udp_session_cleanup_loop(state: Arc<ServerState>) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        let stale: Vec<SocketAddr> = {
+            let conns = state.connections.read().unwrap();
+            let mut stale = Vec::new();
+            for (addr, conn) in conns.iter() {
+                if !matches!(conn.sink, ConnectionSink::Udp(..)) {
+                    continue;
+                }
+                match &conn.extension {
+                    Some(ext) if state.registrar.is_registered(ext) => continue,
+                    _ => stale.push(*addr),
+                }
+            }
+            stale
+        };
+        for addr in stale {
+            state.remove_connection(&addr);
+            tracing::info!("清理过期 UDP 会话: {}", addr);
+        }
+    }
+}
+
 /// 处理单个 TLS 连接
 async fn handle_connection(
     tls_stream: tokio_native_tls::TlsStream<tokio::net::TcpStream>,
@@ -160,7 +250,7 @@ async fn handle_connection(
     let (writer_tx, mut writer_rx) = mpsc::channel::<Vec<u8>>(64);
 
     // 注册连接
-    state.register_connection(peer_addr, writer_tx.clone());
+    state.register_connection(peer_addr, ConnectionSink::Stream(writer_tx.clone()));
 
     // 写入任务：从通道接收数据，写入 TLS 流
     let write_handle = tokio::spawn(async move {
@@ -204,12 +294,14 @@ async fn handle_connection(
 
                     // 处理 SIP 消息
                     if let Ok(msg_text) = std::str::from_utf8(&msg_data) {
-                        process_sip_message(msg_text, peer_addr, writer_tx.clone(), &state).await;
+                        let sink = ConnectionSink::Stream(writer_tx.clone());
+                        process_sip_message(msg_text, peer_addr, sink, Transport::Tls, &state)
+                            .await;
                     } else {
                         tracing::warn!("收到非 UTF-8 SIP 消息 来自 {}", peer_addr);
                     }
                 }
-                parser::SipFrameResult::Incomplete => break,
+                parser::SipFrameResult::Incomplete => break, // 缓冲区中无完整消息，继续读取
                 parser::SipFrameResult::Invalid => {
                     tracing::warn!("收到非法 SIP 消息帧，断开连接: {}", peer_addr);
                     break 'read_loop;
@@ -228,9 +320,7 @@ async fn handle_connection(
     let extension = state.remove_connection(&peer_addr);
     if let Some(ext) = &extension {
         tracing::info!("分机 {} 断开连接", ext);
-        if let Some(writer) = state.find_writer_by_extension(ext) {
-            state.router.register_writer(ext, writer);
-        } else {
+        if !state.has_connection_for_extension(ext) {
             state.router.unregister_writer(ext);
         }
     }
@@ -243,7 +333,8 @@ async fn handle_connection(
 async fn process_sip_message(
     msg_text: &str,
     peer_addr: SocketAddr,
-    writer_tx: mpsc::Sender<Vec<u8>>,
+    sink: ConnectionSink,
+    transport: Transport,
     state: &Arc<ServerState>,
 ) {
     if msg_text.trim().is_empty() {
@@ -261,11 +352,18 @@ async fn process_sip_message(
             }
         };
 
-        tracing::debug!("收到 {} 请求 来自 {}", method, peer_addr);
+        tracing::debug!(
+            "收到 {} 请求 来自 {} (transport={})",
+            method,
+            peer_addr,
+            transport.via_token()
+        );
 
         match method.as_str() {
             "REGISTER" => {
-                let response = state.registrar.handle_register(msg_text, peer_addr);
+                let response = state
+                    .registrar
+                    .handle_register(msg_text, peer_addr, transport);
 
                 // 检查是否注册成功（200 OK）
                 let mut pending_delivery: Option<(Arc<Router>, String)> = None;
@@ -276,16 +374,21 @@ async fn process_sip_message(
                             if let Some(ext) = parser::extract_extension(&uri) {
                                 if parser::extract_expires(msg_text) == Some(0) {
                                     state.clear_connection_extension(&peer_addr);
-                                    if let Some(writer) = state.find_writer_by_extension(&ext) {
-                                        state.router.register_writer(&ext, writer);
-                                    } else {
-                                        state.router.unregister_writer(&ext);
-                                    }
+                                    state.router.unregister_writer(&ext);
                                     tracing::info!("分机 {} 已显式注销连接 {}", ext, peer_addr);
                                 } else {
                                     state.set_connection_extension(&peer_addr, ext.clone());
-                                    state.router.register_writer(&ext, writer_tx.clone());
-                                    tracing::info!("分机 {} 已关联连接 {}", ext, peer_addr);
+                                    // TLS 连接注册写入通道；UDP 无持久连接，
+                                    // 转发时由 Router 按注册表（transport_addr）动态反查
+                                    if transport == Transport::Tls {
+                                        state.router.register_writer(&ext, sink.clone());
+                                    }
+                                    tracing::info!(
+                                        "分机 {} 已关联连接 {} ({})",
+                                        ext,
+                                        peer_addr,
+                                        transport.via_token()
+                                    );
                                     // 注册成功：稍后后台补投该分机的离线即时消息
                                     pending_delivery = Some((Arc::clone(&state.router), ext));
                                 }
@@ -296,7 +399,9 @@ async fn process_sip_message(
 
                 // 先回 200 OK，避免离线补投（最多串行发送 100 条，通道容量有限）
                 // 阻塞注册确认
-                let _ = writer_tx.send(response).await;
+                if let Err(e) = sink.send(response).await {
+                    tracing::error!("发送 REGISTER 响应失败 ({}): {}", peer_addr, e);
+                }
                 if let Some((router, ext)) = pending_delivery {
                     tokio::spawn(async move {
                         router.deliver_offline_messages(&ext).await;
@@ -304,33 +409,48 @@ async fn process_sip_message(
                 }
             }
             "INVITE" => {
-                // 主叫分机号取自连接认证的分机（不信任 From 头，防伪造）
-                let from_ext = state.get_connection_extension(&peer_addr).unwrap_or_default();
                 let response = state
                     .router
-                    .handle_invite(msg_text, writer_tx.clone(), peer_addr, &from_ext)
+                    .handle_invite(msg_text, sink.clone(), peer_addr)
                     .await;
-                let _ = writer_tx.send(response).await;
+                if let Err(e) = sink.send(response).await {
+                    tracing::error!("发送 INVITE 响应失败 ({}): {}", peer_addr, e);
+                }
             }
             "ACK" => {
                 state.router.handle_ack(msg_text).await;
             }
             "BYE" => {
+                // from_extension 用于 BYE 转发方向判断。UDP 设备经 NAT 重绑定后
+                // 来源地址（尤其端口）可能变化，连接层 exact match 会失败；
+                // 此时回退到 From 头提取分机号（消息级身份，UDP/TLS 都携带）。
                 let from_ext = state
                     .get_connection_extension(&peer_addr)
+                    .or_else(|| {
+                        parser::extract_uri_from_header(msg_text, "From")
+                            .and_then(|uri| parser::extract_extension(&uri))
+                    })
                     .unwrap_or_default();
                 let response = state.router.handle_bye(msg_text, &from_ext).await;
-                let _ = writer_tx.send(response).await;
+                if let Err(e) = sink.send(response).await {
+                    tracing::error!("发送 BYE 响应失败 ({}): {}", peer_addr, e);
+                }
             }
             "CANCEL" => {
                 let response = state.router.handle_cancel(msg_text).await;
-                let _ = writer_tx.send(response).await;
+                if let Err(e) = sink.send(response).await {
+                    tracing::error!("发送 CANCEL 响应失败 ({}): {}", peer_addr, e);
+                }
             }
             "MESSAGE" => {
                 // 即时消息：主叫分机号取自连接认证的分机（不信任 From 头）
-                let from_ext = state.get_connection_extension(&peer_addr).unwrap_or_default();
+                let from_ext = state
+                    .get_connection_extension(&peer_addr)
+                    .unwrap_or_default();
                 let response = state.router.handle_message(msg_text, &from_ext).await;
-                let _ = writer_tx.send(response).await;
+                if let Err(e) = sink.send(response).await {
+                    tracing::error!("发送 MESSAGE 响应失败 ({}): {}", peer_addr, e);
+                }
             }
             "OPTIONS" => {
                 // 心跳 / 能力查询 — 直接回 200 OK
@@ -339,16 +459,23 @@ async fn process_sip_message(
                     200,
                     "OK",
                     &[
-                        ("Allow", "INVITE, ACK, BYE, CANCEL, REGISTER, OPTIONS, MESSAGE"),
+                        (
+                            "Allow",
+                            "INVITE, ACK, BYE, CANCEL, REGISTER, OPTIONS, MESSAGE",
+                        ),
                         ("Accept", "application/sdp"),
                     ],
                 );
-                let _ = writer_tx.send(response).await;
+                if let Err(e) = sink.send(response).await {
+                    tracing::error!("发送 OPTIONS 响应失败 ({}): {}", peer_addr, e);
+                }
             }
             _ => {
                 tracing::debug!("不支持的方法: {}", method);
                 let response = parser::build_response(msg_text, 405, "Method Not Allowed");
-                let _ = writer_tx.send(response).await;
+                if let Err(e) = sink.send(response).await {
+                    tracing::error!("发送 405 响应失败 ({}): {}", peer_addr, e);
+                }
             }
         }
     } else if parser::is_response(msg_text) {
