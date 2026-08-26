@@ -11,7 +11,7 @@
 - 🔒 **TLS Signaling Encryption** — SIP over TLS (SIPS) on port 5061, TLS 1.2/1.3
 - 🎵 **SRTP Media Encryption** — AES_CM_128_HMAC_SHA1_80 / AEAD_AES_128_GCM (RFC 7714) with SDES key exchange
 - 🔑 **SIP Digest Authentication** — MD5 digest auth with default and per-extension passwords
-- 🛡️ **IP Blacklist** — Permanently block an IP after configurable failures within a configurable window; threshold, window, and on/off are all configurable; anti brute-force and scanning
+- 🛡️ **IP Blocking** — Temporary blocks that auto-expire, separate rate limit for unauthenticated INVITE, trusted CIDR whitelist, protects against brute-force and scanning
 - 📡 **RTP Media Relay** — Transparent server-side relay with address learning
 - 💬 **Extension Instant Messaging** — SIP MESSAGE text exchange; messages are queued while offline and auto-delivered on registration
 - 📱 **Internal Extensions** — 1000–2000 range (configurable), INVITE/BYE/CANCEL/ACK
@@ -172,15 +172,26 @@ Other clients should support SIP over TLS, SDES-SRTP (`AES_CM_128_HMAC_SHA1_80` 
 | `OPTIONS` | Keepalive / capability query |
 | `MESSAGE` | Extension-to-extension instant messaging; queued while offline and auto-delivered on registration |
 
-## IP Blacklist
+## IP Blocking
 
-To prevent password brute-force and port scanning, the server automatically blocks malicious source IPs:
+To prevent password brute-force and port scanning, the server automatically blocks malicious source IPs.
 
-- After **3** registration/auth failures from the same IP within **10 minutes** (600s), the IP is **permanently blocked** (resets when the server restarts);
-- A blocked IP cannot register or place calls;
-- Normal use is unaffected: failure count auto-resets after the counting window, and is cleared immediately upon a successful login.
+**When a block is triggered**
 
-- The block is configurable via the `[ip_block]` section of `config.toml`. 
+After **5** registration/auth failures from the same IP within **10 minutes** (defaults, both configurable), the IP is temporarily blocked.
+
+**What happens while blocked**
+
+- **Auto-recovers, no manual action**: each block lasts longer than the last (default **1 / 10 / 60 minutes**, cap configurable) and expires on its own — no restart needed.
+- **Real users can self-rescue**: during a block, a single successful registration with the correct password **unblocks the IP immediately**; wrong passwords **do not make the block last longer** — the duration is fixed when the block is triggered.
+- **No harm to normal use**: a few mistyped passwords will not trigger a block (5 failures are needed); failures older than the 10-minute window expire, and a successful login clears everything immediately.
+
+**Two independent protections**
+
+- **Separate rate limit for unauthenticated INVITE**: call requests from clients that have not logged in (typically scanners) hit their own rate limit and only cause a short cooldown — they **never** block an IP, so an attacker cannot lock out a network egress by flooding unauthenticated requests.
+- **Whitelist**: add trusted IPs or CIDR networks (e.g. your corporate egress) and they are never counted, blocked, or rate-limited.
+
+All options are configured in the `[ip_block]` section of `config.toml`. 
 ## Project Structure
 
 ```
@@ -200,7 +211,7 @@ minghe/
     │   ├── mod.rs
     │   ├── server.rs         # TLS listener, connection management, routing
     │   ├── parser.rs         # SIP message parsing and building
-    │   ├── registrar.rs      # Digest authentication, registration management, IP blacklist
+    │   ├── registrar.rs      # Digest authentication, registration management, IP blocking (backoff + rate limit + whitelist)
     │   ├── router.rs         # INVITE/ACK/BYE/CANCEL call routing
     │   └── transaction.rs    # Transaction tracking and timeout cleanup
     └── media/
