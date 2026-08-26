@@ -50,8 +50,6 @@ clap = { version = "4", features = ["derive"] }
 # Utilities
 bytes = "1"
 uuid = { version = "1", features = ["v4"] }
-# CIDR/IP 网段解析与匹配（白名单）
-ipnet = "2"
 
 # Linux（OpenSSL 后端）上将传统 PKCS#1 私钥转换为 PKCS#8 所需。
 # 不在 Windows 编译（Windows 走 Schannel，无需该转换能力）。
