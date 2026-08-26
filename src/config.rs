@@ -63,6 +63,17 @@ pub struct TlsConfig {
     pub cert_path: String,
     /// 私钥文件路径（留空则自动生成自签名证书）
     pub key_path: String,
+    /// TLS 最低协议版本（"1.0"/"1.1"/"1.2"/"1.3"，默认 "1.2"）
+    ///
+    /// 默认 TLS 1.2。接入 HX4G 等老式网关时，若设备仅支持 TLS 1.0/1.1，
+    /// 可下调到 "1.0" 或 "1.1"（会降低安全性，请仅在受信网络中使用）。
+    #[serde(default = "default_tls_min_version")]
+    pub tls_min_version: String,
+}
+
+/// tls_min_version 默认值
+fn default_tls_min_version() -> String {
+    "1.2".to_string()
 }
 
 /// 媒体（RTP）中继配置
@@ -174,6 +185,18 @@ impl AppConfig {
                 config.media.media_addr
             )
             .into());
+        }
+
+// 校验 TLS 最低版本
+        match config.tls.tls_min_version.trim() {
+            "1.0" | "1.1" | "1.2" | "1.3" => {}
+            other => {
+                return Err(format!(
+                    "tls_min_version '{}' 无效，支持的值: \"1.0\" / \"1.1\" / \"1.2\" / \"1.3\"",
+                    other
+                )
+                .into());
+            }
         }
 
         // 校验 IP 封锁配置

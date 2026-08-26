@@ -1,20 +1,21 @@
 //! TLS 证书管理模块
 //!
 //! 负责 TLS 证书的加载或自动生成自签名证书，以及构建 TLS acceptor。
-//! 支持证书自动续期：后台任务定期检查证书有效期，到期前自动重新生成。
+//! 基于 native-tls：Windows 使用系统 Schannel，Linux 使用系统 OpenSSL。
+//!
+//! 选择 native-tls/OpenSSL 而非 rustls 的原因：HX4G 等老式 VoIP 网关的
+//! ClientHello 不发送 signature_algorithms 扩展，rustls 0.23 强制要求该扩展
+//! （报 PeerIncompatible::SignatureAlgorithmsExtensionRequired）导致无法握手；
+//! OpenSSL 按 RFC 5246 允许缺省签名算法，是兼容此类设备的可靠途径。
 //!
 //! 功能概述：
 //! - 如果配置中指定了证书和私钥路径，则从磁盘加载
 //! - 如果路径为空，则使用 rcgen 自动生成自签名证书并保存到 `certs/` 目录
 //! - 构建并返回可热重载的 `ReloadableTlsAcceptor`
 //! - 自签名证书自动续期（到期前 30 天自动重新生成）
+//! - 支持配置 TLS 最低版本（tls_min_version，默认 TLS 1.2）
 
-use std::io::BufReader;
 use std::sync::{Arc, RwLock};
-
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls::ServerConfig;
-use tokio_rustls::TlsAcceptor;
 
 use crate::config::TlsConfig;
 
@@ -33,24 +34,24 @@ const CHECK_INTERVAL_SECS: u64 = 6 * 3600;
 /// 新连接会使用最新的证书，已建立的连接不受影响。
 #[derive(Clone)]
 pub struct ReloadableTlsAcceptor {
-    inner: Arc<RwLock<TlsAcceptor>>,
+    inner: Arc<RwLock<tokio_native_tls::TlsAcceptor>>,
 }
 
 impl ReloadableTlsAcceptor {
     /// 创建新的可重载 acceptor
-    fn new(acceptor: TlsAcceptor) -> Self {
+    fn new(acceptor: tokio_native_tls::TlsAcceptor) -> Self {
         Self {
             inner: Arc::new(RwLock::new(acceptor)),
         }
     }
 
     /// 获取当前的 TlsAcceptor 快照
-    pub fn current(&self) -> TlsAcceptor {
+    pub fn current(&self) -> tokio_native_tls::TlsAcceptor {
         self.inner.read().unwrap().clone()
     }
 
     /// 热重载：替换内部的 TlsAcceptor
-    fn reload(&self, new_acceptor: TlsAcceptor) {
+    fn reload(&self, new_acceptor: tokio_native_tls::TlsAcceptor) {
         let mut guard = self.inner.write().unwrap();
         *guard = new_acceptor;
         tracing::info!("TLS 证书已热重载，新连接将使用新证书");
@@ -65,7 +66,9 @@ pub fn setup_tls(
     config: &TlsConfig,
     host: &str,
 ) -> Result<ReloadableTlsAcceptor, Box<dyn std::error::Error>> {
-    let (certs, key) = if config.cert_path.is_empty() || config.key_path.is_empty() {
+    let min_version = parse_min_version(&config.tls_min_version)?;
+
+    let (cert_pem, key_pem) = if config.cert_path.is_empty() || config.key_path.is_empty() {
         // 检查是否有已存在的未过期证书
         let certs_dir = std::path::Path::new("certs");
         let cert_file = certs_dir.join("server.crt");
@@ -76,9 +79,15 @@ pub fn setup_tls(
             if let Ok(pem_data) = std::fs::read(&cert_file) {
                 if !is_cert_expiring_soon(&pem_data) {
                     tracing::info!("使用已有自签名证书（未到期）: {}", cert_file.display());
-                    let certs = load_certs_from_path(cert_file.to_str().unwrap())?;
-                    let key = load_key_from_path(key_file.to_str().unwrap())?;
-                    return Ok(ReloadableTlsAcceptor::new(build_acceptor(certs, key)?));
+                    let cert_pem = std::fs::read(&cert_file)
+                        .map_err(|e| format!("读取证书文件失败: {}", e))?;
+                    let key_pem = std::fs::read(&key_file)
+                        .map_err(|e| format!("读取私钥文件失败: {}", e))?;
+                    return Ok(ReloadableTlsAcceptor::new(build_acceptor(
+                        &cert_pem,
+                        &key_pem,
+                        min_version,
+                    )?));
                 }
                 tracing::info!("已有证书即将过期，重新生成...");
             }
@@ -92,13 +101,16 @@ pub fn setup_tls(
             config.cert_path,
             config.key_path
         );
-        let certs = load_certs_from_path(&config.cert_path)?;
-        let key = load_key_from_path(&config.key_path)?;
-        tracing::info!("TLS 证书加载成功（共 {} 张证书）", certs.len());
-        (certs, key)
+        let cert_pem = std::fs::read(&config.cert_path).map_err(|e| {
+            format!("无法读取证书文件 '{}': {}", config.cert_path, e)
+        })?;
+        let key_pem = std::fs::read(&config.key_path).map_err(|e| {
+            format!("无法读取私钥文件 '{}': {}", config.key_path, e)
+        })?;
+        (cert_pem, key_pem)
     };
 
-    let acceptor = build_acceptor(certs, key)?;
+    let acceptor = build_acceptor(&cert_pem, &key_pem, min_version)?;
     tracing::info!("TLS acceptor 初始化成功");
     Ok(ReloadableTlsAcceptor::new(acceptor))
 }
@@ -117,6 +129,14 @@ pub fn start_cert_renewal_task(
         tracing::info!("使用外部证书，跳过自动续期（请使用外部工具管理证书更新）");
         return;
     }
+
+    let min_version = match parse_min_version(&config.tls_min_version) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("tls_min_version 无效，自动续期任务已禁用: {}", e);
+            return;
+        }
+    };
 
     tracing::info!(
         "证书自动续期已启用: 每 {} 小时检查一次，到期前 {} 天续期",
@@ -141,18 +161,20 @@ pub fn start_cert_renewal_task(
             if needs_renewal {
                 tracing::info!("证书即将过期或不可读，正在自动续期...");
                 match generate_and_save_cert(&host) {
-                    Ok((certs, key)) => match build_acceptor(certs, key) {
-                        Ok(new_acceptor) => {
-                            tls_acceptor.reload(new_acceptor);
-                            tracing::info!(
-                                "证书自动续期成功！新证书有效期 {} 天",
-                                CERT_VALIDITY_DAYS
-                            );
+                    Ok((cert_pem, key_pem)) => {
+                        match build_acceptor(&cert_pem, &key_pem, min_version) {
+                            Ok(new_acceptor) => {
+                                tls_acceptor.reload(new_acceptor);
+                                tracing::info!(
+                                    "证书自动续期成功！新证书有效期 {} 天",
+                                    CERT_VALIDITY_DAYS
+                                );
+                            }
+                            Err(e) => {
+                                tracing::error!("证书续期后构建 TLS acceptor 失败: {}", e);
+                            }
                         }
-                        Err(e) => {
-                            tracing::error!("证书续期后构建 TLS acceptor 失败: {}", e);
-                        }
-                    },
+                    }
                     Err(e) => {
                         tracing::error!("证书自动续期失败: {}", e);
                     }
@@ -166,7 +188,9 @@ pub fn start_cert_renewal_task(
 
 /// 检查 PEM 编码的证书是否即将过期
 ///
-/// 解析证书的 Not After 时间，如果距离到期不足 RENEWAL_DAYS_BEFORE 天则返回 true
+/// 解析 PEM 中的 Not After 日期
+/// rcgen/x509 的完整解析较重，这里使用简单的文本扫描
+/// 自签名证书文件旁边保存一个 .expiry 元数据文件
 fn is_cert_expiring_soon(pem_data: &[u8]) -> bool {
     // 解析 PEM 中的 Not After 日期
     // rcgen/x509 的完整解析较重，这里使用简单的文本扫描
@@ -203,9 +227,11 @@ fn is_cert_expiring_soon(pem_data: &[u8]) -> bool {
 }
 
 /// 生成自签名证书并保存到 certs/ 目录
+///
+/// 返回 (证书 PEM, 私钥 PEM)。
 fn generate_and_save_cert(
     host: &str,
-) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), Box<dyn std::error::Error>> {
+) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error>> {
     let (cert_pem, key_pem) = generate_self_signed(host)?;
 
     // 保存到 certs/ 目录
@@ -259,14 +285,10 @@ fn generate_and_save_cert(
         );
     }
 
-    // 解析 PEM 数据
-    let certs = parse_cert_pem(&cert_pem)?;
-    let key = parse_key_pem(&key_pem)?;
-
-    Ok((certs, key))
+    Ok((cert_pem, key_pem))
 }
 
-/// 使用 rcgen 生成自签名证书
+/// 使用 rcgen 生成自签名证书（默认 ECDSA P-256）
 fn generate_self_signed(host: &str) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error>> {
     use rcgen::{CertificateParams, DnType, KeyPair, SanType};
     use std::net::IpAddr;
@@ -331,72 +353,80 @@ fn generate_self_signed(host: &str) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::e
     Ok((cert_pem, key_pem))
 }
 
-/// 从 PEM 字节解析证书
-fn parse_cert_pem(
-    pem_data: &[u8],
-) -> Result<Vec<CertificateDer<'static>>, Box<dyn std::error::Error>> {
-    let mut reader = BufReader::new(pem_data);
-    let certs = rustls_pemfile::certs(&mut reader)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("证书 PEM 解析失败: {}", e))?;
-    Ok(certs)
-}
-
-/// 从 PEM 字节解析私钥
-fn parse_key_pem(pem_data: &[u8]) -> Result<PrivateKeyDer<'static>, Box<dyn std::error::Error>> {
-    let mut reader = BufReader::new(pem_data);
-    let key = rustls_pemfile::private_key(&mut reader)
-        .map_err(|e| format!("私钥 PEM 解析失败: {}", e))?
-        .ok_or("PEM 中未找到有效私钥")?;
-    Ok(key)
-}
-
-/// 从文件路径加载证书链
-fn load_certs_from_path(
-    path: &str,
-) -> Result<Vec<CertificateDer<'static>>, Box<dyn std::error::Error>> {
-    let file =
-        std::fs::File::open(path).map_err(|e| format!("无法打开证书文件 '{}': {}", path, e))?;
-    let mut reader = BufReader::new(file);
-
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut reader)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("证书文件 '{}' 解析失败: {}", path, e))?;
-
-    if certs.is_empty() {
-        return Err(format!("证书文件 '{}' 中未找到有效证书", path).into());
-    }
-
-    tracing::debug!("从 '{}' 加载了 {} 张证书", path, certs.len());
-    Ok(certs)
-}
-
-/// 从文件路径加载私钥
-fn load_key_from_path(path: &str) -> Result<PrivateKeyDer<'static>, Box<dyn std::error::Error>> {
-    let file =
-        std::fs::File::open(path).map_err(|e| format!("无法打开私钥文件 '{}': {}", path, e))?;
-    let mut reader = BufReader::new(file);
-
-    let key = rustls_pemfile::private_key(&mut reader)
-        .map_err(|e| format!("私钥文件 '{}' 解析失败: {}", path, e))?
-        .ok_or_else(|| format!("私钥文件 '{}' 中未找到有效私钥", path))?;
-
-    tracing::debug!("从 '{}' 成功加载私钥", path);
-    Ok(key)
-}
-
 /// 构建 TLS Acceptor
 fn build_acceptor(
-    certs: Vec<CertificateDer<'static>>,
-    key: PrivateKeyDer<'static>,
-) -> Result<TlsAcceptor, Box<dyn std::error::Error>> {
-    let tls_config =
-        ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_protocol_versions(&[&rustls::version::TLS12, &rustls::version::TLS13])
-            .map_err(|e| format!("TLS 协议版本配置失败: {}", e))?
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .map_err(|e| format!("TLS ServerConfig 构建失败: {}", e))?;
+    cert_pem: &[u8],
+    key_pem: &[u8],
+    min_version: native_tls::Protocol,
+) -> Result<tokio_native_tls::TlsAcceptor, Box<dyn std::error::Error>> {
+    // 证书链 PEM（leaf 在前）与 PKCS#8 私钥 PEM 分开传入，全平台可用。
+    // 注意：Windows（Schannel）后端仅支持 RSA 私钥；自签名默认生成 ECDSA，
+    // 因此在 Windows 上若要本地运行，请通过 cert_path/key_path 提供 RSA 证书。
+    // Linux（OpenSSL 后端）对 EC/RSA 均支持。
+    let key_pem = ensure_pkcs8_key(key_pem)?;
+    let identity = native_tls::Identity::from_pkcs8(cert_pem, &key_pem)
+        .map_err(|e| format!("加载 PEM 证书/私钥失败: {}", e))?;
 
-    Ok(TlsAcceptor::from(Arc::new(tls_config)))
+    let acceptor = native_tls::TlsAcceptor::builder(identity)
+        .min_protocol_version(Some(min_version))
+        .build()
+        .map_err(|e| format!("native-tls acceptor 构建失败: {}", e))?;
+
+    Ok(tokio_native_tls::TlsAcceptor::from(acceptor))
+}
+
+/// 确保私钥为 PKCS#8 PEM 格式
+///
+/// `Identity::from_pkcs8` 严格要求 PKCS#8（`-----BEGIN PRIVATE KEY-----`）。
+/// 但很多外部证书的私钥是传统 PKCS#1（`-----BEGIN RSA PRIVATE KEY-----`）
+/// 或 EC 传统格式（`-----BEGIN EC PRIVATE KEY-----`）。这里在 Linux
+/// （OpenSSL 后端）上自动转换，避免用户因私钥格式问题启动失败。
+#[cfg(not(windows))]
+fn ensure_pkcs8_key(key_pem: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let text = std::str::from_utf8(key_pem)
+        .map_err(|e| format!("私钥文件不是有效 UTF-8 (PEM): {}", e))?;
+    if text.contains("-----BEGIN PRIVATE KEY-----") {
+        return Ok(key_pem.to_vec());
+    }
+
+    tracing::warn!("私钥不是 PKCS#8 格式，正在自动转换为 PKCS#8 ...");
+    let pkey = openssl::pkey::PKey::private_key_from_pem(key_pem)
+        .map_err(|e| format!("解析私钥失败（支持 PKCS#1 / PKCS#8 / EC 格式）: {}", e))?;
+    let pkcs8 = pkey
+        .private_key_to_pem_pkcs8()
+        .map_err(|e| format!("私钥转换为 PKCS#8 失败: {}", e))?;
+    Ok(pkcs8)
+}
+
+/// Windows（Schannel）分支：无 openssl crate，直接透传；
+/// 非 PKCS#8 格式时给出清晰的转换指引。
+#[cfg(windows)]
+fn ensure_pkcs8_key(key_pem: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let text = std::str::from_utf8(key_pem)
+        .map_err(|e| format!("私钥文件不是有效 UTF-8 (PEM): {}", e))?;
+    if text.contains("-----BEGIN PRIVATE KEY-----") {
+        Ok(key_pem.to_vec())
+    } else {
+        Err("私钥不是 PKCS#8 格式（Windows 本地无法自动转换）。请先用 OpenSSL 转换: \
+             `openssl pkcs8 -topk8 -nocrypt -in server.key -out server.pkcs8.key` \
+             并将配置的 key_path 指向转换后的文件"
+            .into())
+    }
+}
+
+/// 解析配置的 TLS 最低版本字符串
+fn parse_min_version(
+    s: &str,
+) -> Result<native_tls::Protocol, Box<dyn std::error::Error>> {
+    match s.trim() {
+        "1.0" => Ok(native_tls::Protocol::Tlsv10),
+        "1.1" => Ok(native_tls::Protocol::Tlsv11),
+        "1.2" => Ok(native_tls::Protocol::Tlsv12),
+        "1.3" => Ok(native_tls::Protocol::Tlsv13),
+        other => Err(format!(
+            "tls_min_version '{}' 无效，支持: \"1.0\" / \"1.1\" / \"1.2\" / \"1.3\"",
+            other
+        )
+        .into()),
+    }
 }

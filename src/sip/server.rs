@@ -150,7 +150,7 @@ pub async fn run(
 
 /// 处理单个 TLS 连接
 async fn handle_connection(
-    tls_stream: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+    tls_stream: tokio_native_tls::TlsStream<tokio::net::TcpStream>,
     peer_addr: SocketAddr,
     state: Arc<ServerState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

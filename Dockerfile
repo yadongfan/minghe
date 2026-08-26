@@ -7,6 +7,14 @@ FROM rust:bookworm AS builder
 
 WORKDIR /build
 
+# 安装 OpenSSL 开发库（native-tls 在 Linux 上依赖 openssl-sys 编译）
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        libssl-dev \
+        pkg-config \
+        && \
+    rm -rf /var/lib/apt/lists/*
+
 # 先复制依赖清单，利用 Docker 层缓存
 COPY Cargo.toml Cargo.lock* ./
 
@@ -27,9 +35,11 @@ RUN touch src/main.rs && \
 FROM debian:bookworm-slim
 
 # 安装最小运行时依赖
+# libssl3: native-tls 运行时依赖 OpenSSL 动态库
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         ca-certificates \
+        libssl3 \
         && \
     rm -rf /var/lib/apt/lists/*
 
