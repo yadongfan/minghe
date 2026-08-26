@@ -1,6 +1,7 @@
 # MingHe (鸣鹤)
 
 **Minimal Secure SIP Voice Communication Server** — Written in Pure Rust
+This branch is designed for legacy hardware (FXO gateways, older IPPBX) and supports UDP and TLS 1.0. When enabling compatibility support, please ensure it is deployed only within a trusted internal network and never exposed directly to the public Internet.
 
 [中文文档](README.md)
 

@@ -1,6 +1,7 @@
 # 鸣鹤 (MingHe)
 
 **最小化安全 SIP 语音通信服务器** — 纯 Rust 编写
+本分支为老旧硬件（FXO 网关、老式 IPPBX），支持 UDP 和 TLS 1.0。开启兼容支持后请务必仅在可信网部署配置，勿直接暴露至公网。
 
 [English](README_EN.md)
 
