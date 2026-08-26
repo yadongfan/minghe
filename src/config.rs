@@ -101,6 +101,35 @@ pub struct IpBlockConfig {
     /// 封锁表（`blocked_ips`）最大条目数，达到上限后不再新增封锁（内存保护，降级为仅告警）
     #[serde(default = "default_max_blocked_ips")]
     pub max_blocked_ips: usize,
+    /// 未认证 INVITE 限速阈值（每 `invite_window_secs` 窗口）
+    ///
+    /// 未认证连接发起的 INVITE 是端口/分机扫描的常见载体，与密码失败共用封锁
+    /// 阈值会导致攻击者无需猜密码即可触发封锁。因此未认证 INVITE 走独立限速：
+    /// 窗口内达到该次数后进入 `invite_cooldown_secs` 冷却，冷却期内直接拒绝，
+    /// 不进入封锁表、不永久封禁。
+    #[serde(default = "default_invite_limit")]
+    pub invite_limit: u32,
+    /// 未认证 INVITE 限速统计窗口（秒）
+    #[serde(default = "default_invite_window_secs")]
+    pub invite_window_secs: u64,
+    /// 未认证 INVITE 触发限速后的冷却时长（秒）
+    #[serde(default = "default_invite_cooldown_secs")]
+    pub invite_cooldown_secs: u64,
+    /// 退避初始时长（秒）：第 1 次封锁持续该时长
+    #[serde(default = "default_ban_base_secs")]
+    pub ban_base_secs: u64,
+    /// 退避递增倍率：第 n 次封锁时长 = `ban_base_secs * ban_factor^(n-1)`（封顶于 `max_ban_secs`）
+    #[serde(default = "default_ban_factor")]
+    pub ban_factor: u32,
+    /// 退避封顶时长（秒）：封锁时长上限，可配到天级（如 30 天 = `2592000`）
+    #[serde(default = "default_max_ban_secs")]
+    pub max_ban_secs: u64,
+    /// 白名单（可信 IP / CIDR 网段，如 `"10.0.0.0/8"`、`"192.168.1.100"`）
+    ///
+    /// 命中白名单的来源不计数、不封锁、不限速。适用于企业出口网段等可信源，
+    /// 与退避封锁互补：白名单覆盖已知可信源，退避覆盖白名单之外的意外。
+    #[serde(default = "default_whitelist")]
+    pub whitelist: Vec<String>,
 }
 
 impl Default for IpBlockConfig {
@@ -111,6 +140,13 @@ impl Default for IpBlockConfig {
             window_secs: default_window_secs(),
             max_failed_ips: default_max_failed_ips(),
             max_blocked_ips: default_max_blocked_ips(),
+            invite_limit: default_invite_limit(),
+            invite_window_secs: default_invite_window_secs(),
+            invite_cooldown_secs: default_invite_cooldown_secs(),
+            ban_base_secs: default_ban_base_secs(),
+            ban_factor: default_ban_factor(),
+            max_ban_secs: default_max_ban_secs(),
+            whitelist: default_whitelist(),
         }
     }
 }
@@ -120,7 +156,7 @@ fn default_ip_block_enabled() -> bool {
 }
 
 fn default_max_failures() -> u32 {
-    3
+    5
 }
 
 fn default_window_secs() -> u64 {
@@ -133,6 +169,34 @@ fn default_max_failed_ips() -> usize {
 
 fn default_max_blocked_ips() -> usize {
     50_000
+}
+
+fn default_invite_limit() -> u32 {
+    10
+}
+
+fn default_invite_window_secs() -> u64 {
+    60
+}
+
+fn default_invite_cooldown_secs() -> u64 {
+    60
+}
+
+fn default_ban_base_secs() -> u64 {
+    60
+}
+
+fn default_ban_factor() -> u32 {
+    10
+}
+
+fn default_max_ban_secs() -> u64 {
+    3600
+}
+
+fn default_whitelist() -> Vec<String> {
+    Vec::new()
 }
 
 impl AppConfig {
@@ -189,6 +253,39 @@ impl AppConfig {
             }
             if config.ip_block.max_blocked_ips == 0 {
                 return Err("ip_block.max_blocked_ips 必须大于 0（或设置 ip_block.enabled = false 关闭封锁）".into());
+            }
+            if config.ip_block.invite_limit == 0 {
+                return Err("ip_block.invite_limit 必须大于 0（或设置 ip_block.enabled = false 关闭限速）".into());
+            }
+            if config.ip_block.invite_window_secs == 0 {
+                return Err("ip_block.invite_window_secs 必须大于 0（或设置 ip_block.enabled = false 关闭限速）".into());
+            }
+            if config.ip_block.invite_cooldown_secs == 0 {
+                return Err("ip_block.invite_cooldown_secs 必须大于 0（或设置 ip_block.enabled = false 关闭限速）".into());
+            }
+            if config.ip_block.ban_base_secs == 0 {
+                return Err("ip_block.ban_base_secs 必须大于 0（或设置 ip_block.enabled = false 关闭封锁）".into());
+            }
+            if config.ip_block.max_ban_secs == 0 {
+                return Err("ip_block.max_ban_secs 必须大于 0（或设置 ip_block.enabled = false 关闭封锁）".into());
+            }
+            if config.ip_block.ban_factor < 1 {
+                return Err("ip_block.ban_factor 必须 >= 1（或设置 ip_block.enabled = false 关闭封锁）".into());
+            }
+            if config.ip_block.max_ban_secs < config.ip_block.ban_base_secs {
+                return Err("ip_block.max_ban_secs 必须 >= ban_base_secs（封顶时长不能短于首次封锁时长）".into());
+            }
+        }
+        // 校验白名单项均为合法 IP 或 CIDR（无论是否启用封锁，配置都须合法）
+        for item in &config.ip_block.whitelist {
+            let valid = item.parse::<std::net::IpAddr>().is_ok()
+                || item.parse::<ipnet::IpNet>().is_ok();
+            if !valid {
+                return Err(format!(
+                    "ip_block.whitelist 中的 '{}' 不是有效的 IP 或 CIDR（示例：\"10.0.0.0/8\"、\"192.168.1.100\"）",
+                    item
+                )
+                .into());
             }
         }
         if config.ip_block.enabled {
@@ -280,13 +377,20 @@ mod tests {
 
     #[test]
     fn ip_block_config_defaults_match_original_constants() {
-        // 缺省值应与原写死常量一致：启用、阈值 3、窗口 600s、失败表 10 万、封锁表 5 万
+        // 缺省值应与配置默认一致：启用、阈值 5、窗口 600s、失败表 10 万、封锁表 5 万
         let cfg = IpBlockConfig::default();
         assert!(cfg.enabled);
-        assert_eq!(cfg.max_failures, 3);
+        assert_eq!(cfg.max_failures, 5);
         assert_eq!(cfg.window_secs, 600);
         assert_eq!(cfg.max_failed_ips, 100_000);
         assert_eq!(cfg.max_blocked_ips, 50_000);
+        assert_eq!(cfg.invite_limit, 10);
+        assert_eq!(cfg.invite_window_secs, 60);
+        assert_eq!(cfg.invite_cooldown_secs, 60);
+        assert_eq!(cfg.ban_base_secs, 60);
+        assert_eq!(cfg.ban_factor, 10);
+        assert_eq!(cfg.max_ban_secs, 3600);
+        assert!(cfg.whitelist.is_empty());
     }
 
     #[test]
@@ -314,10 +418,17 @@ media_addr = "192.168.1.100"
 "#;
         let config: AppConfig = toml::from_str(toml).unwrap();
         assert!(config.ip_block.enabled);
-        assert_eq!(config.ip_block.max_failures, 3);
+        assert_eq!(config.ip_block.max_failures, 5);
         assert_eq!(config.ip_block.window_secs, 600);
         assert_eq!(config.ip_block.max_failed_ips, 100_000);
         assert_eq!(config.ip_block.max_blocked_ips, 50_000);
+        assert_eq!(config.ip_block.invite_limit, 10);
+        assert_eq!(config.ip_block.invite_window_secs, 60);
+        assert_eq!(config.ip_block.invite_cooldown_secs, 60);
+        assert_eq!(config.ip_block.ban_base_secs, 60);
+        assert_eq!(config.ip_block.ban_factor, 10);
+        assert_eq!(config.ip_block.max_ban_secs, 3600);
+        assert!(config.ip_block.whitelist.is_empty());
     }
 
     #[test]
@@ -348,6 +459,13 @@ max_failures = 10
 window_secs = 120
 max_failed_ips = 5000
 max_blocked_ips = 2000
+invite_limit = 20
+invite_window_secs = 30
+invite_cooldown_secs = 120
+ban_base_secs = 30
+ban_factor = 2
+max_ban_secs = 900
+whitelist = ["10.0.0.0/8", "192.168.1.100"]
 "#;
         let config: AppConfig = toml::from_str(toml).unwrap();
         assert!(!config.ip_block.enabled);
@@ -355,6 +473,13 @@ max_blocked_ips = 2000
         assert_eq!(config.ip_block.window_secs, 120);
         assert_eq!(config.ip_block.max_failed_ips, 5000);
         assert_eq!(config.ip_block.max_blocked_ips, 2000);
+        assert_eq!(config.ip_block.invite_limit, 20);
+        assert_eq!(config.ip_block.invite_window_secs, 30);
+        assert_eq!(config.ip_block.invite_cooldown_secs, 120);
+        assert_eq!(config.ip_block.ban_base_secs, 30);
+        assert_eq!(config.ip_block.ban_factor, 2);
+        assert_eq!(config.ip_block.max_ban_secs, 900);
+        assert_eq!(config.ip_block.whitelist, vec!["10.0.0.0/8".to_string(), "192.168.1.100".to_string()]);
     }
 
     #[test]
@@ -388,6 +513,138 @@ window_secs = 600
         assert!(config.is_err(), "启用时 max_failures=0 应被拒绝");
     }
 
+    #[test]
+    fn load_rejects_zero_invite_limit_when_enabled() {
+        let toml = r#"
+[server]
+listen_addr = "0.0.0.0"
+sip_port = 5061
+host = "minghe.local"
+
+[extensions]
+range_start = 1000
+range_end = 2000
+default_password = "pw"
+
+[tls]
+cert_path = ""
+key_path = ""
+
+[media]
+rtp_port_start = 20000
+rtp_port_end = 20020
+media_addr = "192.168.1.100"
+
+[ip_block]
+enabled = true
+invite_limit = 0
+"#;
+        let config: Result<AppConfig, Box<dyn std::error::Error>> = AppConfig::load_from_str_for_test(toml);
+        assert!(config.is_err(), "启用时 invite_limit=0 应被拒绝");
+    }
+
+    #[test]
+    fn load_rejects_invalid_backoff_config_when_enabled() {
+        // 封顶短于首次封锁时长的配置无意义，应被拒绝
+        let toml = r#"
+[server]
+listen_addr = "0.0.0.0"
+sip_port = 5061
+host = "minghe.local"
+
+[extensions]
+range_start = 1000
+range_end = 2000
+default_password = "pw"
+
+[tls]
+cert_path = ""
+key_path = ""
+
+[media]
+rtp_port_start = 20000
+rtp_port_end = 20020
+media_addr = "192.168.1.100"
+
+[ip_block]
+enabled = true
+ban_base_secs = 600
+max_ban_secs = 60
+"#;
+        let config: Result<AppConfig, Box<dyn std::error::Error>> = AppConfig::load_from_str_for_test(toml);
+        assert!(config.is_err(), "max_ban_secs < ban_base_secs 应被拒绝");
+    }
+
+    #[test]
+    fn load_accepts_valid_whitelist() {
+        // 白名单支持 IP 与 CIDR；load_from_str_for_test 未包含白名单校验（复用 load 逻辑），
+        // 因此这里直接验证 toml 解析层面的字段解析
+        let toml = r#"
+[server]
+listen_addr = "0.0.0.0"
+sip_port = 5061
+host = "minghe.local"
+
+[extensions]
+range_start = 1000
+range_end = 2000
+default_password = "pw"
+
+[tls]
+cert_path = ""
+key_path = ""
+
+[media]
+rtp_port_start = 20000
+rtp_port_end = 20020
+media_addr = "192.168.1.100"
+
+[ip_block]
+enabled = true
+whitelist = ["10.0.0.0/8", "192.168.1.100", "2001:db8::/32"]
+"#;
+        let config: AppConfig = toml::from_str(toml).unwrap();
+        assert_eq!(
+            config.ip_block.whitelist,
+            vec![
+                "10.0.0.0/8".to_string(),
+                "192.168.1.100".to_string(),
+                "2001:db8::/32".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn load_rejects_invalid_whitelist_item() {
+        // 非法白名单项应在 load 校验阶段被拒绝
+        let toml = r#"
+[server]
+listen_addr = "0.0.0.0"
+sip_port = 5061
+host = "minghe.local"
+
+[extensions]
+range_start = 1000
+range_end = 2000
+default_password = "pw"
+
+[tls]
+cert_path = ""
+key_path = ""
+
+[media]
+rtp_port_start = 20000
+rtp_port_end = 20020
+media_addr = "192.168.1.100"
+
+[ip_block]
+enabled = true
+whitelist = ["not-an-ip-or-cidr"]
+"#;
+        let config: Result<AppConfig, Box<dyn std::error::Error>> = AppConfig::load_from_str_for_test(toml);
+        assert!(config.is_err(), "非法白名单项应被拒绝");
+    }
+
     impl AppConfig {
         /// 测试辅助：从 TOML 字符串加载（绕过文件读取），复用 load 的校验逻辑
         fn load_from_str_for_test(content: &str) -> Result<Self, Box<dyn std::error::Error>> {
@@ -406,6 +663,39 @@ window_secs = 600
                 }
                 if config.ip_block.max_blocked_ips == 0 {
                     return Err("ip_block.max_blocked_ips 必须大于 0".into());
+                }
+                if config.ip_block.invite_limit == 0 {
+                    return Err("ip_block.invite_limit 必须大于 0".into());
+                }
+                if config.ip_block.invite_window_secs == 0 {
+                    return Err("ip_block.invite_window_secs 必须大于 0".into());
+                }
+                if config.ip_block.invite_cooldown_secs == 0 {
+                    return Err("ip_block.invite_cooldown_secs 必须大于 0".into());
+                }
+                if config.ip_block.ban_base_secs == 0 {
+                    return Err("ip_block.ban_base_secs 必须大于 0".into());
+                }
+                if config.ip_block.max_ban_secs == 0 {
+                    return Err("ip_block.max_ban_secs 必须大于 0".into());
+                }
+                if config.ip_block.ban_factor < 1 {
+                    return Err("ip_block.ban_factor 必须 >= 1".into());
+                }
+                if config.ip_block.max_ban_secs < config.ip_block.ban_base_secs {
+                    return Err("ip_block.max_ban_secs 必须 >= ban_base_secs".into());
+                }
+            }
+            // 校验白名单项均为合法 IP 或 CIDR（与 load 相同）
+            for item in &config.ip_block.whitelist {
+                let valid = item.parse::<std::net::IpAddr>().is_ok()
+                    || item.parse::<ipnet::IpNet>().is_ok();
+                if !valid {
+                    return Err(format!(
+                        "ip_block.whitelist 中的 '{}' 不是有效的 IP 或 CIDR",
+                        item
+                    )
+                    .into());
                 }
             }
             Ok(config)

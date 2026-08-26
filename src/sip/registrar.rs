@@ -3,10 +3,11 @@
 //! 管理分机的注册状态，实现 SIP Digest 认证。
 //! 支持 REGISTER 请求的完整处理流程：认证挑战 → 验证 → 注册/注销。
 
+use ipnet::IpNet;
 use md5::{Digest, Md5};
 use rand::Rng;
-use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, RwLock};
 
 use super::parser;
@@ -59,8 +60,14 @@ pub struct RegistrarService {
     ip_block: IpBlockPolicy,
     /// IP -> 窗口内失败记录（达到阈值后移入封锁表并移除本表条目）
     failed_ips: RwLock<HashMap<String, FailedIpEntry>>,
-    /// 已被封锁的 IP（窗口内累计失败达到阈值，进程生命周期内不解封）
-    blocked_ips: RwLock<HashSet<String>>,
+    /// 已被封锁的 IP -> 封锁到期时间戳与等级（临时封锁 + 递增退避，到期自动解封）
+    blocked_ips: RwLock<HashMap<String, BlockedEntry>>,
+    /// 各 IP 最近一次封锁等级（解封后再触顶时递增；认证成功时重置）
+    ban_levels: RwLock<HashMap<String, u32>>,
+    /// 未认证 INVITE 限速计数表：IP -> 窗口内未认证 INVITE 次数
+    invite_counts: RwLock<HashMap<String, InviteCountEntry>>,
+    /// 未认证 INVITE 限速冷却表：IP -> 冷却到期时间戳（冷却期内直接拒绝）
+    invite_cooldowns: RwLock<HashMap<String, u64>>,
 }
 
 /// 单个 IP 在失败窗口内的计数记录
@@ -72,6 +79,24 @@ struct FailedIpEntry {
     window_start: u64,
 }
 
+/// 单个 IP 在未认证 INVITE 限速窗口内的计数记录
+#[derive(Debug, Clone, Copy)]
+struct InviteCountEntry {
+    /// 窗口内未认证 INVITE 次数
+    count: u32,
+    /// 窗口起点（Unix 秒），超过窗口自动重置/清理
+    window_start: u64,
+}
+
+/// 封锁表条目：记录封锁到期时间与当前退避等级
+#[derive(Debug, Clone, Copy)]
+struct BlockedEntry {
+    /// 封锁到期时间戳（Unix 秒），`now < until` 时该 IP 视为被封锁
+    until: u64,
+    /// 当前退避等级（第 n 次封锁），决定本次封锁时长
+    level: u32,
+}
+
 /// 失败计数表（`failed_ips`）默认最大条目数，防止攻击者用海量不同 IP 撑爆内存
 const DEFAULT_MAX_FAILED_IPS: usize = 100_000;
 
@@ -79,7 +104,7 @@ const DEFAULT_MAX_FAILED_IPS: usize = 100_000;
 const DEFAULT_MAX_BLOCKED_IPS: usize = 50_000;
 
 /// IP 封锁策略参数（来自配置，而非写死常量）
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct IpBlockPolicy {
     /// 是否启用 IP 封锁
     pub enabled: bool,
@@ -91,17 +116,38 @@ pub struct IpBlockPolicy {
     pub max_failed_ips: usize,
     /// 封锁表最大条目数（内存保护上限，达到后降级为仅告警）
     pub max_blocked_ips: usize,
+    /// 未认证 INVITE 限速阈值（每 `invite_window_secs` 窗口）
+    pub invite_limit: u32,
+    /// 未认证 INVITE 限速统计窗口（秒）
+    pub invite_window_secs: u64,
+    /// 未认证 INVITE 触发限速后的冷却时长（秒）
+    pub invite_cooldown_secs: u64,
+    /// 退避初始时长（秒）：第 1 次封锁持续该时长
+    pub ban_base_secs: u64,
+    /// 退避递增倍率：第 n 次封锁时长 = `ban_base_secs * ban_factor^(n-1)`（封顶于 `max_ban_secs`）
+    pub ban_factor: u32,
+    /// 退避封顶时长（秒）：封锁时长上限，可配到天级（如 30 天 = `2592000`）
+    pub max_ban_secs: u64,
+    /// 白名单（可信 IP / CIDR 网段）：命中不计数、不封锁、不限速
+    pub whitelist: Vec<IpNet>,
 }
 
 impl Default for IpBlockPolicy {
-    /// 默认策略：启用、阈值 3 次、窗口 600s（与原写死常量一致）
+    /// 默认策略：启用、阈值 5 次、窗口 600s（与 IpBlockConfig 默认一致）
     fn default() -> Self {
         Self {
             enabled: true,
-            max_failures: 3,
+            max_failures: 5,
             window_secs: 600,
             max_failed_ips: DEFAULT_MAX_FAILED_IPS,
             max_blocked_ips: DEFAULT_MAX_BLOCKED_IPS,
+            invite_limit: 10,
+            invite_window_secs: 60,
+            invite_cooldown_secs: 60,
+            ban_base_secs: 60,
+            ban_factor: 10,
+            max_ban_secs: 3600,
+            whitelist: Vec::new(),
         }
     }
 }
@@ -115,6 +161,13 @@ impl IpBlockPolicy {
             window_secs: 600,
             max_failed_ips: DEFAULT_MAX_FAILED_IPS,
             max_blocked_ips: DEFAULT_MAX_BLOCKED_IPS,
+            invite_limit: u32::MAX,
+            invite_window_secs: 60,
+            invite_cooldown_secs: 60,
+            ban_base_secs: 60,
+            ban_factor: 10,
+            max_ban_secs: 3600,
+            whitelist: Vec::new(),
         }
     }
 }
@@ -127,8 +180,30 @@ impl From<&crate::config::IpBlockConfig> for IpBlockPolicy {
             window_secs: cfg.window_secs,
             max_failed_ips: cfg.max_failed_ips,
             max_blocked_ips: cfg.max_blocked_ips,
+            invite_limit: cfg.invite_limit,
+            invite_window_secs: cfg.invite_window_secs,
+            invite_cooldown_secs: cfg.invite_cooldown_secs,
+            ban_base_secs: cfg.ban_base_secs,
+            ban_factor: cfg.ban_factor,
+            max_ban_secs: cfg.max_ban_secs,
+            whitelist: parse_whitelist(&cfg.whitelist),
         }
     }
+}
+
+/// 把白名单字符串列表解析为 [IpNet]（纯 IP 视为全位主机；配置加载时已校验合法）
+fn parse_whitelist(items: &[String]) -> Vec<IpNet> {
+    items
+        .iter()
+        .filter_map(|s| {
+            s.parse::<IpNet>().ok().or_else(|| {
+                s.parse::<IpAddr>().ok().and_then(|addr| {
+                    let prefix = if addr.is_ipv4() { 32 } else { 128 };
+                    IpNet::new(addr, prefix).ok()
+                })
+            })
+        })
+        .collect()
 }
 
 /// 当前 Unix 秒
@@ -164,38 +239,72 @@ impl RegistrarService {
             range_end,
             ip_block,
             failed_ips: RwLock::new(HashMap::new()),
-            blocked_ips: RwLock::new(HashSet::new()),
+            blocked_ips: RwLock::new(HashMap::new()),
+            ban_levels: RwLock::new(HashMap::new()),
+            invite_counts: RwLock::new(HashMap::new()),
+            invite_cooldowns: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// 判断来源 IP 是否命中白名单（可信 IP / CIDR 网段）
+    ///
+    /// 命中白名单的来源不计数、不封锁、不限速。IP 无法解析时视为未命中。
+    fn is_whitelisted(&self, ip: &str) -> bool {
+        if self.ip_block.whitelist.is_empty() {
+            return false;
+        }
+        let Ok(addr) = ip.parse::<IpAddr>() else {
+            return false;
+        };
+        self.ip_block.whitelist.iter().any(|net| net.contains(&addr))
     }
 
     /// 检查指定 IP 是否已被封锁
     ///
     /// `pub(crate)`：供 [Router] 在 INVITE 等其它方法上复用同一封锁表。
-    /// IP 封锁关闭时始终返回 `false`。
+    /// IP 封锁关闭或命中白名单时始终返回 `false`。
+    ///
+    /// 临时封锁：`blocked_ips` 记录到期时间戳，未到期返回 `true`；到期则懒清理
+    /// （移除条目并把等级写回 `ban_levels`，供解封后再触顶时递增），返回 `false`。
     pub(crate) fn is_blocked(&self, ip: &str) -> bool {
-        if !self.ip_block.enabled {
+        if !self.ip_block.enabled || self.is_whitelisted(ip) {
             return false;
         }
-        self.blocked_ips.read().unwrap().contains(ip)
+        let now = now_secs();
+        let mut blocked = self.blocked_ips.write().unwrap();
+        match blocked.get(ip) {
+            Some(entry) if now < entry.until => true,
+            Some(entry) => {
+                // 封锁到期：懒清理，保留等级供下次递增
+                let level = entry.level;
+                blocked.remove(ip);
+                drop(blocked);
+                self.ban_levels.write().unwrap().insert(ip.to_string(), level);
+                false
+            }
+            None => false,
+        }
     }
 
     /// 记录一次失败（注册、认证或未认证呼叫探测）；窗口内累计达到阈值后封锁该 IP 并返回 `true`
     ///
     /// 失败计数使用滑动窗口（`ip_block.window_secs`）：窗口外的失败自动过期，
     /// 避免合法用户因历史偶发失败被永久累计误伤。窗口内累计达到阈值后，该 IP
-    /// 被移入封锁表（进程生命周期内不解封）。
+    /// 被移入封锁表（临时封锁 + 递增退避，`ban_base_secs * ban_factor^(n-1)`，封顶于
+    /// `max_ban_secs`），到期自动解封。
     ///
-    /// IP 封锁关闭（`ip_block.enabled = false`）时，本方法为空操作：不计数、
-    /// 不封锁，始终返回 `false`，所有来源均放行进入认证流程。
+    /// IP 封锁关闭（`ip_block.enabled = false`）或命中白名单时，本方法为空操作：
+    /// 不计数、不封锁，始终返回 `false`，所有来源均放行进入认证流程。
     ///
     /// 两张表均有容量上限（`ip_block.max_failed_ips` / `ip_block.max_blocked_ips`），防止攻击者
     /// 用海量不同 IP 撑爆内存；达到上限时优先清理过期条目，仍满则清空失败表
-    /// 或拒绝新增封锁并告警（降级为仅限流，不崩溃）。
+    /// 或拒绝新增封锁并告警（降级为仅限流，不崩溃）。退避封锁因到期自动回收，
+    /// 封锁表在持续分布式攻击下不会像永久封锁那样累积到上限后整体失效。
     ///
     /// `pub(crate)`：供 [Router] 在 INVITE 等其它方法上复用同一失败计数。
     pub(crate) fn record_failure(&self, ip: &str) -> bool {
-        // IP 封锁关闭：不计数、不封锁，直接放行
-        if !self.ip_block.enabled {
+        // IP 封锁关闭或命中白名单：不计数、不封锁，直接放行
+        if !self.ip_block.enabled || self.is_whitelisted(ip) {
             return false;
         }
 
@@ -243,7 +352,7 @@ impl RegistrarService {
                 return false;
             }
 
-            // 达到阈值：移入封锁表（本表条目移除），窗口内单线程已持写锁，无并发丢计数
+            // 达到阈值：计算退避时长并移入封锁表（本表条目移除），窗口内单线程已持写锁，无并发丢计数
             failed.remove(ip);
         }
 
@@ -256,18 +365,178 @@ impl RegistrarService {
             );
             return false;
         }
-        blocked.insert(ip.to_string());
+        // 递增退避：上次封锁等级 +1，时长按 base * factor^(level-1) 递增，封顶于 max_ban_secs
+        let level = {
+            let levels = self.ban_levels.read().unwrap();
+            levels.get(ip).copied().unwrap_or(0) + 1
+        };
+        let duration = self.ban_duration(level);
+        blocked.insert(
+            ip.to_string(),
+            BlockedEntry {
+                until: now.saturating_add(duration),
+                level,
+            },
+        );
+        drop(blocked);
+        let mut levels = self.ban_levels.write().unwrap();
+        // 等级表容量上限（复用 max_blocked_ips）：满则清空，下次封锁从等级 1 重新开始（内存保护）
+        if levels.len() >= max_blocked_ips {
+            tracing::warn!(
+                "ban_levels 表超过上限 ({} 条)，清空以保护内存（下次封锁从等级 1 重新开始）",
+                max_blocked_ips
+            );
+            levels.clear();
+        }
+        levels.insert(ip.to_string(), level);
         tracing::warn!(
             ip = %ip,
-            "认证/呼叫失败累计 {} 次，已永久封锁该 IP",
-            max_failures
+            "认证/呼叫失败累计 {} 次，封锁 {}s（退避等级 {}，封顶 {}s）",
+            max_failures,
+            duration,
+            level,
+            self.ip_block.max_ban_secs
         );
         true
     }
 
+    /// 计算第 `level` 次封锁的时长（递增退避，封顶于 `max_ban_secs`）
+    fn ban_duration(&self, level: u32) -> u64 {
+        let base = self.ip_block.ban_base_secs;
+        let factor = self.ip_block.ban_factor.max(1) as u64;
+        let max = self.ip_block.max_ban_secs;
+        let mut dur = base;
+        if factor > 1 {
+            for _ in 1..level {
+                if dur >= max {
+                    break;
+                }
+                dur = dur.saturating_mul(factor);
+                if dur > max {
+                    dur = max;
+                }
+            }
+        }
+        dur.min(max)
+    }
+
     /// 清除指定 IP 的失败计数（注册/认证成功时调用，避免合法用户被历史失败累计误伤）
+    ///
+    /// 同时重置退避等级；若该 IP 处于封锁中则一并解除（认证成功提前解封）。
     pub(crate) fn clear_failures(&self, ip: &str) {
         self.failed_ips.write().unwrap().remove(ip);
+        self.unblock(ip);
+    }
+
+    /// 立即解除指定 IP 的封锁并重置退避等级（认证成功提前解封；对未封锁 IP 为空操作）
+    pub(crate) fn unblock(&self, ip: &str) {
+        self.blocked_ips.write().unwrap().remove(ip);
+        self.ban_levels.write().unwrap().remove(ip);
+    }
+
+    /// 检查指定 IP 是否处于未认证 INVITE 限速冷却期
+    ///
+    /// 冷却期内未认证 INVITE 直接拒绝（不重复计数）。与封锁表完全隔离：
+    /// 未认证 INVITE 不会触发 IP 封锁，攻击者无需猜密码即可触发封锁的问题由此消除。
+    ///
+    /// IP 封锁关闭（`ip_block.enabled = false`）或命中白名单时始终返回 `false`（不限速）。
+    pub(crate) fn is_invite_limited(&self, ip: &str) -> bool {
+        if !self.ip_block.enabled || self.is_whitelisted(ip) {
+            return false;
+        }
+        let now = now_secs();
+        let mut cooldowns = self.invite_cooldowns.write().unwrap();
+        match cooldowns.get(ip) {
+            Some(&until) if now < until => true,
+            // 冷却到期：懒清理
+            Some(_) => {
+                cooldowns.remove(ip);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// 记录一次未认证 INVITE；窗口内达到限速阈值后进入冷却期
+    ///
+    /// 与 [record_failure] 独立：未认证 INVITE 走滑动窗口限速（`invite_limit` 次 /
+    /// `invite_window_secs`），触发后冷却 `invite_cooldown_secs` 秒，不进入封锁表。
+    ///
+    /// IP 封锁关闭（`ip_block.enabled = false`）或命中白名单时为空操作。
+    pub(crate) fn record_unauthed_invite(&self, ip: &str) {
+        if !self.ip_block.enabled || self.is_whitelisted(ip) {
+            return;
+        }
+        // 已在冷却期：不重复计数
+        if self.is_invite_limited(ip) {
+            return;
+        }
+
+        let now = now_secs();
+        let window_secs = self.ip_block.invite_window_secs;
+        let limit = self.ip_block.invite_limit;
+        let cooldown_secs = self.ip_block.invite_cooldown_secs;
+        let max_counts = self.ip_block.max_failed_ips;
+        let max_cooldowns = self.ip_block.max_blocked_ips;
+
+        let mut counts = self.invite_counts.write().unwrap();
+        // 容量上限：先清理窗口过期条目，仍超限则清空（丢计数换取内存安全，与 failed_ips 一致）
+        if counts.len() >= max_counts {
+            counts.retain(|_, e| now.saturating_sub(e.window_start) < window_secs);
+            if counts.len() >= max_counts {
+                tracing::warn!(
+                    "invite_counts 表超过上限 ({} 条)，清空以保护内存",
+                    max_counts
+                );
+                counts.clear();
+            }
+        }
+        let entry = counts.entry(ip.to_string()).or_insert(InviteCountEntry {
+            count: 0,
+            window_start: now,
+        });
+        // 窗口过期：重置计数，重新开始窗口
+        if now.saturating_sub(entry.window_start) >= window_secs {
+            entry.count = 0;
+            entry.window_start = now;
+        }
+        entry.count += 1;
+
+        if entry.count < limit {
+            tracing::debug!(
+                ip = %ip,
+                "未认证 INVITE {}/{}（{}s 窗口内达到 {} 次将限速 {}s）",
+                entry.count,
+                limit,
+                window_secs,
+                limit,
+                cooldown_secs
+            );
+            return;
+        }
+
+        // 达到限速阈值：进入冷却并清空窗口计数
+        counts.remove(ip);
+        drop(counts);
+        let mut cooldowns = self.invite_cooldowns.write().unwrap();
+        // 冷却表容量上限（复用 max_blocked_ips）：先清理已到期条目，仍满则拒绝新增冷却（降级）
+        if cooldowns.len() >= max_cooldowns {
+            cooldowns.retain(|_, until| now < *until);
+            if cooldowns.len() >= max_cooldowns {
+                tracing::warn!(
+                    "invite_cooldowns 表已满 ({} 条)，拒绝新增冷却（内存保护降级）",
+                    max_cooldowns
+                );
+                return;
+            }
+        }
+        cooldowns.insert(ip.to_string(), now + cooldown_secs);
+        tracing::warn!(
+            ip = %ip,
+            "未认证 INVITE 窗口内达到 {} 次，限速 {}s（不进入封锁表）",
+            limit,
+            cooldown_secs
+        );
     }
 
     /// 获取指定分机的密码
@@ -295,12 +564,23 @@ impl RegistrarService {
         // 来源 IP（封禁按 IP 维度统计，不含端口）
         let ip = from_addr.ip().to_string();
 
-        // 已被封锁的 IP 直接拒绝，不再进入任何认证流程
-        if self.is_blocked(&ip) {
-            // 已达封锁阈值的 IP 高频刷请求，若逐条打 WARN 日志会刷屏；
-            // 降为 debug（默认日志级别不输出），仅记录一次封锁事件即可。
-            tracing::debug!(ip = %ip, "该 IP 已因多次注册失败被封锁，拒绝其 REGISTER 请求");
-            return parser::build_response(request_text, 403, "Forbidden");
+        // 已被封锁的 IP：携带 Authorization 的请求放行进入认证流程尝试自救
+        // （认证成功即解封，见下方认证成功分支）；无凭据直接拒绝。
+        // 封锁期内认证失败不再计入失败计数（不刷新/延长封锁），否则攻击者可用
+        // 任意错误凭据持续请求让封锁永不到期、退避等级无界增长。
+        let ip_blocked = self.is_blocked(&ip);
+        if ip_blocked {
+            let has_auth = parser::extract_header_value(request_text, "Authorization").is_some();
+            if !has_auth {
+                // 已达封锁阈值的 IP 高频刷请求，若逐条打 WARN 日志会刷屏；
+                // 降为 debug（默认日志级别不输出），仅记录一次封锁事件即可。
+                tracing::debug!(ip = %ip, "该 IP 已被封锁且无认证凭据，拒绝其 REGISTER 请求");
+                return parser::build_response(request_text, 403, "Forbidden");
+            }
+            tracing::info!(
+                ip = %ip,
+                "该 IP 已被封锁，请求携带认证凭据，尝试认证自救（成功即解封）"
+            );
         }
 
         // 提取分机号
@@ -316,7 +596,9 @@ impl RegistrarService {
             Some(ext) => ext,
             None => {
                 tracing::warn!(ip = %ip, "REGISTER 请求缺少有效的分机号");
-                self.record_failure(&ip);
+                if !ip_blocked {
+                    self.record_failure(&ip);
+                }
                 return parser::build_response(request_text, 400, "Bad Request");
             }
         };
@@ -326,7 +608,9 @@ impl RegistrarService {
             Ok(n) => n,
             Err(_) => {
                 tracing::warn!(ip = %ip, "无效的分机号格式: {}", extension);
-                self.record_failure(&ip);
+                if !ip_blocked {
+                    self.record_failure(&ip);
+                }
                 return parser::build_response(request_text, 403, "Forbidden");
             }
         };
@@ -339,7 +623,9 @@ impl RegistrarService {
                 self.range_start,
                 self.range_end
             );
-            self.record_failure(&ip);
+            if !ip_blocked {
+                self.record_failure(&ip);
+            }
             return parser::build_response(request_text, 403, "Forbidden");
         }
 
@@ -390,13 +676,16 @@ impl RegistrarService {
                     params.cnonce.as_deref(),
                 ) {
                     tracing::warn!(ip = %ip, "分机 {} 认证失败", extension);
-                    self.record_failure(&ip);
+                    if !ip_blocked {
+                        self.record_failure(&ip);
+                    }
                     return parser::build_response(request_text, 403, "Forbidden");
                 }
 
                 // 认证成功
                 tracing::info!("分机 {} 认证成功（来自 {}）", extension, from_addr);
-                // 成功清除该 IP 的失败计数，避免历史偶发失败累计到封锁阈值
+                // 成功清除该 IP 的失败计数与退避等级；若该 IP 处于封锁中则提前解封
+                //（认证成功提前解封，真实用户输对一次密码即可自救，攻击者无凭据无法利用）
                 self.clear_failures(&ip);
 
                 // 检查 Expires
@@ -799,7 +1088,20 @@ mod tests {
             HashMap::new(),
             1000,
             2000,
-            IpBlockPolicy::default(),
+            IpBlockPolicy {
+                enabled: true,
+                max_failures: 3,
+                window_secs: 600,
+                max_failed_ips: 100_000,
+                max_blocked_ips: 50_000,
+                invite_limit: 10,
+                invite_window_secs: 60,
+                invite_cooldown_secs: 60,
+                ban_base_secs: 60,
+                ban_factor: 10,
+                max_ban_secs: 3600,
+                whitelist: Vec::new(),
+            },
         );
         let from: SocketAddr = "203.0.113.9:5061".parse().unwrap();
 
@@ -851,7 +1153,8 @@ mod tests {
             IpBlockPolicy::default(),
         );
         // 同一 IP 不同端口（攻击者高频换端口）累计失败同样封禁该 IP
-        for port in [5061u16, 5300, 5500] {
+        // 默认阈值为 5：5 次失败（不同端口）来自同一 IP → 应已封锁
+        for port in [5061u16, 5300, 5500, 5700, 5900] {
             let from: SocketAddr = format!("203.0.113.20:{}", port).parse().unwrap();
             let resp = registrar.handle_register(
                 &register_request("99999", &format!("port-{}", port), ""),
@@ -863,7 +1166,7 @@ mod tests {
                 Some(403)
             );
         }
-        // 三次失败（三个不同端口）来自同一 IP → 应已封锁
+        // 5 次失败（五个不同端口）来自同一 IP → 应已封锁
         assert!(registrar.is_blocked("203.0.113.20"));
     }
 
@@ -904,8 +1207,8 @@ mod tests {
             .starts_with("SIP/2.0 200 OK"));
         assert!(!registrar.is_blocked("203.0.113.30"));
 
-        // 清除后重新失败：累计 2 次不封锁，第 3 次才封锁（证明计数已被重置）
-        for i in 0..2 {
+        // 清除后重新失败：默认阈值 5，累计 4 次不封锁，第 5 次才封锁（证明计数已被重置）
+        for i in 0..4 {
             let resp = registrar.handle_register(
                 &register_request("80002", &format!("fail2-{}", i), ""),
                 from,
@@ -918,7 +1221,7 @@ mod tests {
             from,
         );
         let _ = resp;
-        assert!(registrar.is_blocked("203.0.113.30"), "重置后第 3 次失败应封锁");
+        assert!(registrar.is_blocked("203.0.113.30"), "重置后第 5 次失败应封锁");
     }
 
     #[test]
@@ -929,7 +1232,20 @@ mod tests {
             HashMap::new(),
             1000,
             2000,
-            IpBlockPolicy::default(),
+            IpBlockPolicy {
+                enabled: true,
+                max_failures: 3,
+                window_secs: 600,
+                max_failed_ips: 100_000,
+                max_blocked_ips: 50_000,
+                invite_limit: 10,
+                invite_window_secs: 60,
+                invite_cooldown_secs: 60,
+                ban_base_secs: 60,
+                ban_factor: 10,
+                max_ban_secs: 3600,
+                whitelist: Vec::new(),
+            },
         );
         // 2 次失败（count=2），随后直接把窗口起点拨到窗口外
         for i in 0..2 {
@@ -964,6 +1280,13 @@ mod tests {
                 window_secs: 600,
                 max_failed_ips: 4,
                 max_blocked_ips: 50_000,
+                invite_limit: 10,
+                invite_window_secs: 60,
+                invite_cooldown_secs: 60,
+                ban_base_secs: 60,
+                ban_factor: 10,
+                max_ban_secs: 3600,
+                whitelist: Vec::new(),
             },
         );
         // 填满失败表（模拟扫描器海量不同 IP）
@@ -1007,6 +1330,13 @@ mod tests {
                 window_secs: 600,
                 max_failed_ips: 100_000,
                 max_blocked_ips: 4,
+                invite_limit: 10,
+                invite_window_secs: 60,
+                invite_cooldown_secs: 60,
+                ban_base_secs: 60,
+                ban_factor: 10,
+                max_ban_secs: 3600,
+                whitelist: Vec::new(),
             },
         );
         // 直接填满封锁表
@@ -1014,7 +1344,13 @@ mod tests {
         {
             let mut blocked = registrar.blocked_ips.write().unwrap();
             for i in 0..cap {
-                blocked.insert(format!("198.51.{}.{}", (i >> 8) % 256, i % 256));
+                blocked.insert(
+                    format!("198.51.{}.{}", (i >> 8) % 256, i % 256),
+                    BlockedEntry {
+                        until: u64::MAX,
+                        level: 1,
+                    },
+                );
             }
         }
         // 表满后新增封锁被拒绝（内存保护降级），不 panic
@@ -1046,7 +1382,13 @@ mod tests {
                 .blocked_ips
                 .write()
                 .unwrap()
-                .insert("203.0.113.77".to_string());
+                .insert(
+                    "203.0.113.77".to_string(),
+                    BlockedEntry {
+                        until: u64::MAX,
+                        level: 1,
+                    },
+                );
         }
         assert!(!registrar.is_blocked("203.0.113.77"));
     }
@@ -1066,6 +1408,13 @@ mod tests {
                 window_secs: 600,
                 max_failed_ips: 100_000,
                 max_blocked_ips: 50_000,
+                invite_limit: 10,
+                invite_window_secs: 60,
+                invite_cooldown_secs: 60,
+                ban_base_secs: 60,
+                ban_factor: 10,
+                max_ban_secs: 3600,
+                whitelist: Vec::new(),
             },
         );
         for _ in 0..4 {
@@ -1091,6 +1440,13 @@ mod tests {
                 window_secs: 60,
                 max_failed_ips: 100_000,
                 max_blocked_ips: 50_000,
+                invite_limit: 10,
+                invite_window_secs: 60,
+                invite_cooldown_secs: 60,
+                ban_base_secs: 60,
+                ban_factor: 10,
+                max_ban_secs: 3600,
+                whitelist: Vec::new(),
             },
         );
         // 2 次失败后拨到窗口外
@@ -1107,5 +1463,402 @@ mod tests {
         assert!(!registrar.record_failure("203.0.113.99"));
         assert!(!registrar.record_failure("203.0.113.99"));
         assert!(!registrar.is_blocked("203.0.113.99"));
+    }
+
+    /// 构造测试用默认策略（阈值 3、限速与退避默认、无白名单）
+    fn test_policy() -> IpBlockPolicy {
+        IpBlockPolicy {
+            enabled: true,
+            max_failures: 3,
+            window_secs: 600,
+            max_failed_ips: 100_000,
+            max_blocked_ips: 50_000,
+            invite_limit: 10,
+            invite_window_secs: 60,
+            invite_cooldown_secs: 60,
+            ban_base_secs: 60,
+            ban_factor: 10,
+            max_ban_secs: 3600,
+            whitelist: Vec::new(),
+        }
+    }
+
+    /// 把指定 IP 的封锁到期时间拨到过去（模拟封禁时长耗尽）
+    fn expire_ban(registrar: &RegistrarService, ip: &str) {
+        if let Some(entry) = registrar.blocked_ips.write().unwrap().get_mut(ip) {
+            entry.until = now_secs().saturating_sub(1);
+        }
+    }
+
+    /// 读取指定 IP 当前的剩余封锁时长（秒，用于断言退避等级）
+    fn remaining_ban_secs(registrar: &RegistrarService, ip: &str) -> u64 {
+        registrar
+            .blocked_ips
+            .read()
+            .unwrap()
+            .get(ip)
+            .map(|e| e.until.saturating_sub(now_secs()))
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn unauthed_invite_rate_limit_is_independent_of_blocking() {
+        // 未认证 INVITE 限速与封锁完全隔离：大量未认证 INVITE 只触发冷却,不进入封锁表
+        let registrar = RegistrarService::new(
+            "example.com".to_string(),
+            "pw".to_string(),
+            HashMap::new(),
+            1000,
+            2000,
+            IpBlockPolicy {
+                invite_limit: 3,
+                ..test_policy()
+            },
+        );
+        let ip = "203.0.113.70";
+
+        // 前 2 次未认证 INVITE 未达阈值,不进入冷却
+        for _ in 0..2 {
+            assert!(!registrar.is_invite_limited(ip));
+            registrar.record_unauthed_invite(ip);
+        }
+        assert!(!registrar.is_invite_limited(ip), "2 次未达阈值不应冷却");
+
+        // 第 3 次达到阈值,进入冷却
+        registrar.record_unauthed_invite(ip);
+        assert!(registrar.is_invite_limited(ip), "达到阈值后应进入冷却");
+
+        // 冷却期内不重复计数
+        registrar.record_unauthed_invite(ip);
+
+        // 关键断言:未认证 INVITE 不触发封锁、不产生失败计数
+        assert!(!registrar.is_blocked(ip), "未认证 INVITE 不应导致 IP 封锁");
+        assert!(
+            registrar.failed_ips.read().unwrap().is_empty(),
+            "未认证 INVITE 不应产生失败计数"
+        );
+    }
+
+    #[test]
+    fn unauthed_invite_cooldown_expires_and_recovers() {
+        // 冷却到期后自动恢复,且到期条目被懒清理;恢复后可再次计数并重新触发冷却
+        let registrar = RegistrarService::new(
+            "example.com".to_string(),
+            "pw".to_string(),
+            HashMap::new(),
+            1000,
+            2000,
+            IpBlockPolicy {
+                invite_limit: 2,
+                ..test_policy()
+            },
+        );
+        let ip = "203.0.113.71";
+
+        registrar.record_unauthed_invite(ip); // count 1
+        registrar.record_unauthed_invite(ip); // count 2 → 冷却
+        assert!(registrar.is_invite_limited(ip));
+
+        // 把冷却到期时间拨到过去
+        {
+            let mut cd = registrar.invite_cooldowns.write().unwrap();
+            cd.insert(ip.to_string(), now_secs().saturating_sub(1));
+        }
+        assert!(!registrar.is_invite_limited(ip), "冷却到期后应解除");
+        assert!(
+            registrar.invite_cooldowns.read().unwrap().is_empty(),
+            "到期条目应被懒清理"
+        );
+
+        // 冷却结束后重新计数,再次达到阈值应再次冷却
+        registrar.record_unauthed_invite(ip); // count 1
+        registrar.record_unauthed_invite(ip); // count 2 → 再次冷却
+        assert!(registrar.is_invite_limited(ip), "冷却后应可再次触发");
+    }
+
+    #[test]
+    fn unauthed_invite_rate_limit_disabled_with_ip_block() {
+        // ip_block.enabled = false 时,未认证 INVITE 不限速、不计数
+        let registrar = RegistrarService::new(
+            "example.com".to_string(),
+            "pw".to_string(),
+            HashMap::new(),
+            1000,
+            2000,
+            IpBlockPolicy::disabled(),
+        );
+        let ip = "203.0.113.72";
+        for _ in 0..100 {
+            assert!(!registrar.is_invite_limited(ip));
+            registrar.record_unauthed_invite(ip);
+        }
+        assert!(registrar.invite_counts.read().unwrap().is_empty());
+        assert!(registrar.invite_cooldowns.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn backoff_escalates_and_caps_duration() {
+        // base=60, factor=10, max=3600 → 第 1 次约 60s,第 2 次约 600s,第 3 次封顶 3600s
+        let registrar = RegistrarService::new(
+            "example.com".to_string(),
+            "pw".to_string(),
+            HashMap::new(),
+            1000,
+            2000,
+            IpBlockPolicy {
+                max_failures: 3,
+                ..test_policy()
+            },
+        );
+        let ip = "203.0.113.80";
+
+        // 第 1 次封锁：约 60s
+        for _ in 0..3 {
+            registrar.record_failure(ip);
+        }
+        assert!(registrar.is_blocked(ip));
+        let d1 = remaining_ban_secs(&registrar, ip);
+        assert!((60..600).contains(&d1), "第 1 次应约 60s, got {d1}s");
+
+        // 封禁到期（懒清理）→ 自动解封
+        expire_ban(&registrar, ip);
+        assert!(!registrar.is_blocked(ip), "封禁到期应自动解封");
+
+        // 第 2 次封锁：约 600s
+        for _ in 0..3 {
+            registrar.record_failure(ip);
+        }
+        assert!(registrar.is_blocked(ip));
+        let d2 = remaining_ban_secs(&registrar, ip);
+        assert!((600..3600).contains(&d2), "第 2 次应约 600s, got {d2}s");
+
+        // 到期后再触发第 3 次：封顶 3600s
+        expire_ban(&registrar, ip);
+        assert!(!registrar.is_blocked(ip));
+        for _ in 0..3 {
+            registrar.record_failure(ip);
+        }
+        assert!(registrar.is_blocked(ip));
+        let d3 = remaining_ban_secs(&registrar, ip);
+        assert!((3590..=3600).contains(&d3), "第 3 次应封顶约 3600s, got {d3}s");
+
+        // 持续触顶也不再超过封顶
+        expire_ban(&registrar, ip);
+        for _ in 0..3 {
+            registrar.record_failure(ip);
+        }
+        let d4 = remaining_ban_secs(&registrar, ip);
+        assert!(d4 <= 3600, "封顶后不再增长, got {d4}s");
+    }
+
+    #[test]
+    fn auth_success_unblocks_blocked_ip_and_resets_backoff() {
+        // 封锁期内携带正确凭据的 REGISTER 应提前解封并正常注册（认证成功提前解封）
+        let registrar = RegistrarService::new(
+            "example.com".to_string(),
+            "pw".to_string(),
+            HashMap::new(),
+            1000,
+            2000,
+            test_policy(),
+        );
+        let from: SocketAddr = "203.0.113.81:5061".parse().unwrap();
+
+        // 3 次失败触发封锁
+        for i in 0..3 {
+            let resp = registrar.handle_register(
+                &register_request("80001", &format!("fail-{}", i), ""),
+                from,
+            );
+            assert_eq!(
+                parser::extract_status_code(&String::from_utf8(resp).unwrap()),
+                Some(403)
+            );
+        }
+        assert!(registrar.is_blocked("203.0.113.81"));
+
+        // 封锁期内正确凭据认证成功 → 200 OK + 提前解封
+        let ha1 = md5_hex("1001:example.com:pw");
+        let ha2 = md5_hex("REGISTER:sip:example.com");
+        let response = md5_hex(&format!("{}:testnonce:{}", ha1, ha2));
+        let auth = format!(
+            "Authorization: Digest username=\"1001\", realm=\"example.com\", nonce=\"testnonce\", uri=\"sip:example.com\", response=\"{}\"\r\n",
+            response
+        );
+        let resp = registrar.handle_register(&register_request("1001", "ok", &auth), from);
+        assert!(
+            String::from_utf8(resp).unwrap().starts_with("SIP/2.0 200 OK"),
+            "正确凭据应注册成功并解封"
+        );
+        assert!(!registrar.is_blocked("203.0.113.81"), "认证成功应提前解封");
+
+        // 退避等级已重置：再次触发封锁回到 base（60s）
+        for _ in 0..3 {
+            registrar.record_failure("203.0.113.81");
+        }
+        let d = remaining_ban_secs(&registrar, "203.0.113.81");
+        assert!((60..600).contains(&d), "认证成功应重置退避等级, 本次应约 60s, got {d}s");
+    }
+
+    #[test]
+    fn blocked_ip_with_wrong_credentials_stays_blocked() {
+        // 封锁期内错误凭据仍 403，不解封（攻击者无正确密码无法利用提前解封）
+        let registrar = RegistrarService::new(
+            "example.com".to_string(),
+            "pw".to_string(),
+            HashMap::new(),
+            1000,
+            2000,
+            test_policy(),
+        );
+        let from: SocketAddr = "203.0.113.82:5061".parse().unwrap();
+
+        for _ in 0..3 {
+            registrar.handle_register(&register_request("80001", "fail", ""), from);
+        }
+        assert!(registrar.is_blocked("203.0.113.82"));
+
+        // 携带伪造/错误 response 的 REGISTER：仍 403 且不解封
+        let bad_auth = "Authorization: Digest username=\"1001\", realm=\"example.com\", nonce=\"testnonce\", uri=\"sip:example.com\", response=\"deadbeef\"\r\n";
+        let resp = registrar.handle_register(&register_request("1001", "bad", bad_auth), from);
+        assert_eq!(
+            parser::extract_status_code(&String::from_utf8(resp).unwrap()),
+            Some(403)
+        );
+        assert!(registrar.is_blocked("203.0.113.82"), "错误凭据不应解封");
+
+        // 无凭据请求同样 403
+        let resp = registrar.handle_register(&register_request("1001", "noauth", ""), from);
+        assert_eq!(
+            parser::extract_status_code(&String::from_utf8(resp).unwrap()),
+            Some(403)
+        );
+        assert!(registrar.is_blocked("203.0.113.82"));
+    }
+
+    #[test]
+    fn blocked_ip_wrong_credentials_do_not_extend_block() {
+        // 封锁期内错误凭据不刷新/延长封锁（否则攻击者可用任意错误凭据让封锁永不到期）
+        let registrar = RegistrarService::new(
+            "example.com".to_string(),
+            "pw".to_string(),
+            HashMap::new(),
+            1000,
+            2000,
+            test_policy(),
+        );
+        let from: SocketAddr = "203.0.113.83:5061".parse().unwrap();
+
+        // 触发封锁
+        for _ in 0..3 {
+            registrar.handle_register(&register_request("80001", "fail", ""), from);
+        }
+        assert!(registrar.is_blocked("203.0.113.83"));
+        let d_before = remaining_ban_secs(&registrar, "203.0.113.83");
+        assert!(d_before > 0);
+
+        // 大量错误凭据请求：封锁时长不应被刷新延长（也不应触发新的退避等级）
+        let bad_auth = "Authorization: Digest username=\"1001\", realm=\"example.com\", nonce=\"testnonce\", uri=\"sip:example.com\", response=\"deadbeef\"\r\n";
+        for i in 0..20 {
+            let resp = registrar.handle_register(
+                &register_request("1001", &format!("bad-{}", i), bad_auth),
+                from,
+            );
+            assert_eq!(
+                parser::extract_status_code(&String::from_utf8(resp).unwrap()),
+                Some(403)
+            );
+        }
+        let d_after = remaining_ban_secs(&registrar, "203.0.113.83");
+        assert!(
+            d_after <= d_before,
+            "错误凭据不应延长封锁: before={d_before}s, after={d_after}s"
+        );
+        assert!(registrar.is_blocked("203.0.113.83"));
+    }
+
+    #[test]
+    fn invite_count_tables_respect_capacity_caps() {
+        // 海量不同 IP 各发一次未认证 INVITE 不应无限撑爆计数表/冷却表（内存保护）
+        let registrar = RegistrarService::new(
+            "example.com".to_string(),
+            "pw".to_string(),
+            HashMap::new(),
+            1000,
+            2000,
+            IpBlockPolicy {
+                invite_limit: 3,
+                invite_window_secs: 60,
+                invite_cooldown_secs: 60,
+                max_failed_ips: 8,
+                max_blocked_ips: 4,
+                ..test_policy()
+            },
+        );
+
+        // 填满计数表：超过上限后应清空保护内存，不死锁/不 panic，且限速仍工作
+        for i in 0..20 {
+            registrar.record_unauthed_invite(&format!("198.51.1.{}", i % 250));
+        }
+        let len = registrar.invite_counts.read().unwrap().len();
+        assert!(len <= 8, "invite_counts 应受容量上限约束, got {len}");
+
+        // 填满冷却表：达到上限后拒绝新增冷却（降级），不 panic
+        for i in 0..20 {
+            // 每个 IP 连发 invite_limit 次触发冷却
+            let ip = format!("198.51.2.{}", i);
+            for _ in 0..3 {
+                registrar.record_unauthed_invite(&ip);
+            }
+        }
+        let cooldown_len = registrar.invite_cooldowns.read().unwrap().len();
+        assert!(cooldown_len <= 4, "invite_cooldowns 应受容量上限约束, got {cooldown_len}");
+    }
+
+    #[test]
+    fn whitelisted_ip_is_never_blocked_limited_or_counted() {
+        // 白名单命中：不计数、不封锁、不限速（精确 IP 与 CIDR 均生效）
+        let registrar = RegistrarService::new(
+            "example.com".to_string(),
+            "pw".to_string(),
+            HashMap::new(),
+            1000,
+            2000,
+            IpBlockPolicy {
+                whitelist: vec![
+                    // 精确 IP（全位主机 /32）
+                    IpNet::new("203.0.113.100".parse().unwrap(), 32).unwrap(),
+                    // CIDR 网段
+                    "198.51.100.0/24".parse().unwrap(),
+                ],
+                ..test_policy()
+            },
+        );
+
+        // 白名单内精确 IP：大量失败不封锁、不计数
+        let exact = "203.0.113.100";
+        for _ in 0..100 {
+            assert!(!registrar.record_failure(exact));
+        }
+        assert!(!registrar.is_blocked(exact), "白名单 IP 不应被封锁");
+        assert!(
+            registrar.failed_ips.read().unwrap().is_empty(),
+            "白名单 IP 不应产生失败计数"
+        );
+
+        // 白名单内 CIDR 命中：不限速、不封锁
+        let cidr_hit = "198.51.100.7";
+        for _ in 0..100 {
+            registrar.record_unauthed_invite(cidr_hit);
+        }
+        assert!(!registrar.is_invite_limited(cidr_hit), "白名单 IP 不应被限速");
+        assert!(!registrar.is_blocked(cidr_hit), "白名单 IP 不应被封锁");
+
+        // 白名单外 IP 正常计数并封锁（证明豁免只作用于白名单）
+        let outside = "192.0.2.200";
+        for _ in 0..3 {
+            registrar.record_failure(outside);
+        }
+        assert!(registrar.is_blocked(outside), "白名单外 IP 仍应正常封锁");
     }
 }

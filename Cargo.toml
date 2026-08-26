@@ -48,3 +48,5 @@ clap = { version = "4", features = ["derive"] }
 # Utilities
 bytes = "1"
 uuid = { version = "1", features = ["v4"] }
+# CIDR/IP 网段解析与匹配（白名单）
+ipnet = "2"

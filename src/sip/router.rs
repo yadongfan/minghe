@@ -181,14 +181,14 @@ impl Router {
 
         // 主叫身份校验：信任连接层已认证的分机号（server 在 REGISTER 成功后绑定），
         // 不信任 From 头（客户端可伪造）。未认证连接发起的 INVITE 属于探测/扫描，
-        // 直接拒绝并计入该 IP 的失败（窗口内累计达到阈值即封锁）。
+        // 直接拒绝；走独立限速（不进入封锁表），避免攻击者无需猜密码即可触发 IP 封锁。
         // 拒绝路径打 debug，避免扫描日志刷屏。
         if from_ext.is_empty() {
-            tracing::debug!(
-                ip = %ip,
-                "拒绝未认证连接发起的 INVITE，计入该 IP 失败"
-            );
-            self.registrar.record_failure(&ip);
+            if self.registrar.is_invite_limited(&ip) {
+                tracing::debug!(ip = %ip, "未认证 INVITE 命中限速冷却，直接拒绝");
+            } else {
+                self.registrar.record_unauthed_invite(&ip);
+            }
             return parser::build_response(request_text, 403, "Forbidden");
         }
 
@@ -1724,7 +1724,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invite_from_unauthenticated_connection_is_rejected_and_counts_failure() {
+    async fn invite_from_unauthenticated_connection_is_rejected_and_rate_limited_not_blocked() {
         let (router, caller_tx, _caller_rx) = test_router_with_writer();
         let from: SocketAddr = "203.0.113.50:5061".parse().unwrap();
 
@@ -1738,7 +1738,7 @@ mod tests {
             "Content-Length: 0\r\n\r\n"
         );
 
-        // 未认证连接发起的 INVITE（攻击者探测）应被拒绝 403，且每次计入该 IP 失败
+        // 未认证连接发起的 INVITE（攻击者探测）一律拒绝 403
         for _ in 0..3 {
             let resp = router
                 .handle_invite(&invite, caller_tx.clone(), from, "")
@@ -1749,17 +1749,21 @@ mod tests {
             );
         }
 
-        // 窗口内累计 3 次失败后该 IP 被永久封锁
-        assert!(router.registrar.is_blocked("203.0.113.50"));
+        // 关键新行为：未认证 INVITE 走独立限速，不再触发 IP 封锁（无需猜密码即可封出口的问题消除）
+        assert!(!router.registrar.is_blocked("203.0.113.50"));
 
-        // 封锁后再次 INVITE 仍被直接拒绝
-        let resp = router
-            .handle_invite(&invite, caller_tx.clone(), from, "")
-            .await;
-        assert_eq!(
-            parser::extract_status_code(&String::from_utf8(resp).unwrap()),
-            Some(403)
-        );
+        // 默认 invite_limit=10：累计 10 次后进入限速冷却，但封锁表仍为空
+        for _ in 3..10 {
+            let resp = router
+                .handle_invite(&invite, caller_tx.clone(), from, "")
+                .await;
+            assert_eq!(
+                parser::extract_status_code(&String::from_utf8(resp).unwrap()),
+                Some(403)
+            );
+        }
+        assert!(router.registrar.is_invite_limited("203.0.113.50"), "达到限速阈值应进入冷却");
+        assert!(!router.registrar.is_blocked("203.0.113.50"), "限速冷却不应导致 IP 封锁");
     }
 
     #[tokio::test]
