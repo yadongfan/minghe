@@ -66,6 +66,8 @@ pub struct RegistrarService {
     failed_ips: RwLock<HashMap<String, FailedIpEntry>>,
     /// 已被封锁的 IP（窗口内累计失败达到阈值，进程生命周期内不解封）
     blocked_ips: RwLock<HashSet<String>>,
+    /// 服务端已签发、尚未过期的 nonce（nonce -> 签发信息），用于防重放校验
+    issued_nonces: RwLock<HashMap<String, NonceEntry>>,
 }
 
 /// 单个 IP 在失败窗口内的计数记录
@@ -82,6 +84,25 @@ const DEFAULT_MAX_FAILED_IPS: usize = 100_000;
 
 /// 封锁表（`blocked_ips`）默认最大条目数，达到上限后不再新增封锁（内存保护，降级为仅告警）
 const DEFAULT_MAX_BLOCKED_IPS: usize = 50_000;
+
+/// 服务端签发 nonce 的有效期（秒）：超过该时长未完成认证的 nonce 视为失效，
+/// 防止捕获的认证响应被无限期重放。
+const NONCE_TTL_SECS: u64 = 300;
+
+/// nonce 表（`issued_nonces`）最大条目数：防止攻击者通过不断请求 401 挑战
+/// 高速填充 nonce 表耗尽内存。达到上限时先清理过期条目，仍满则清空整表
+/// （丢弃历史 nonce 换取内存安全，客户端将自动重新挑战）。
+const MAX_ISSUED_NONCES: usize = 100_000;
+
+/// 服务端已签发但尚未过期的 nonce 条目
+struct NonceEntry {
+    /// 签发时间（Unix 秒）
+    issued_at: u64,
+    /// 签发时对应的来源 IP：认证响应必须来自同一 IP，阻断跨来源重放
+    ip: String,
+    /// 已见过的最大的 nc（qop=auth 时用于检测同 nonce 的序列号回退/重放）
+    max_nc: u64,
+}
 
 /// IP 封锁策略参数（来自配置，而非写死常量）
 #[derive(Debug, Clone, Copy)]
@@ -177,6 +198,7 @@ impl RegistrarService {
             insecure_extensions,
             failed_ips: RwLock::new(HashMap::new()),
             blocked_ips: RwLock::new(HashSet::new()),
+            issued_nonces: RwLock::new(HashMap::new()),
         }
     }
 
@@ -377,7 +399,7 @@ impl RegistrarService {
         let auth_header = parser::extract_header_value(request_text, "Authorization");
 
         match auth_header {
-            None => self.digest_challenge(request_text, &extension),
+            None => self.digest_challenge(request_text, &extension, &ip),
             Some(auth_value) => {
                 // 解析并验证 Digest 认证
                 let params = match parse_authorization(&auth_value) {
@@ -392,9 +414,53 @@ impl RegistrarService {
                             extension,
                             auth_value
                         );
-                        return self.digest_challenge(request_text, &extension);
+                        return self.digest_challenge(request_text, &extension, &ip);
                     }
                 };
+
+                // 身份一致性校验：Authorization 的 username 必须等于 To 头分机号。
+                // 防止用"他分机用户名 + 本分机密码"绕过共享密码场景下的分机隔离
+                // （否则知道任一共享密码即可冒用任意分机）。
+                // 注意 realm 不做拒绝性校验：realm 由客户端回声、服务器按同一值
+                // 镜像计算 HA1，攻击者改动 realm 并不能绕过认证（仍需密码）；
+                // 而部分老终端可能用与 domain 不一致的 realm（IP 与域名混用），
+                // 严格拒绝会造成兼容性回归。仅记录日志便于排查。
+                if params.username != extension {
+                    tracing::warn!(
+                        ip = %ip,
+                        "Digest username ({}) 与 To 头分机 ({}) 不一致，拒绝",
+                        params.username,
+                        extension
+                    );
+                    self.record_failure(&ip);
+                    return parser::build_response(request_text, 403, "Forbidden");
+                }
+                if params.realm != self.domain {
+                    tracing::warn!(
+                        ip = %ip,
+                        "Digest realm ({}) 与服务器 domain ({}) 不一致（已按客户端 realm 计算验证）",
+                        params.realm,
+                        self.domain
+                    );
+                }
+
+                // nonce 校验：必须由本服务签发、未过期、来源 IP 一致、nc 递增。
+                // 阻断三类重放：伪造/过期 nonce、跨来源重放（攻击者地址重放嗅探包）、
+                // 同 IP 内的序列号回退重放。校验失败说明请求异常（伪造/重放/过期），
+                // 计入该 IP 失败以配合 IP 封锁兜底，并重新发起挑战。
+                let nc_val = params
+                    .nc
+                    .as_deref()
+                    .and_then(|s| u64::from_str_radix(s, 16).ok());
+                if !self.validate_nonce(&params.nonce, &ip, nc_val, params.qop.as_deref()) {
+                    tracing::warn!(
+                        ip = %ip,
+                        "Digest nonce 无效（可能过期/伪造/跨来源重放），向分机 {} 重新发起挑战",
+                        extension
+                    );
+                    self.record_failure(&ip);
+                    return self.digest_challenge(request_text, &extension, &ip);
+                }
 
                 // 获取请求 URI（用于 Digest 计算）
                 let _request_uri = parser::extract_request_uri(request_text)
@@ -471,12 +537,40 @@ impl RegistrarService {
         }
     }
 
-    /// 生成 401 Digest 挑战响应（带新 nonce）
+    /// 生成 401 Digest 挑战响应（带新 nonce，并记录到 issued_nonces 供防重放校验）
     ///
     /// 用于：无 Authorization 头、或 Authorization 头无法解析（如老终端发送
-    /// nonce/response 为空的空凭证）时，重新发起挑战让客户端按新 nonce 计算响应。
-    fn digest_challenge(&self, request_text: &str, extension: &str) -> Vec<u8> {
+    /// nonce/response 为空的空凭证）、或 nonce 已失效时，重新发起挑战让客户端
+    /// 按新 nonce 计算响应。签发的 nonce 记录签发时间与来源 IP，仅同一来源在
+    /// 有效期内回传才有效。
+    fn digest_challenge(&self, request_text: &str, extension: &str, ip: &str) -> Vec<u8> {
         let nonce = generate_nonce();
+        let now = now_secs();
+        {
+            let mut nonces = self.issued_nonces.write().unwrap();
+
+            // nonce 表容量上限：先清理过期条目，仍满则清空整表（丢历史 nonce
+            // 换取内存安全）。防止攻击者通过高频 401 挑战请求无界填充该表。
+            if nonces.len() >= MAX_ISSUED_NONCES {
+                nonces.retain(|_, e| now.saturating_sub(e.issued_at) < NONCE_TTL_SECS);
+                if nonces.len() >= MAX_ISSUED_NONCES {
+                    tracing::warn!(
+                        "issued_nonces 表超过上限 ({} 条) 且无过期条目可清理，清空 nonce 表以保护内存",
+                        MAX_ISSUED_NONCES
+                    );
+                    nonces.clear();
+                }
+            }
+
+            nonces.insert(
+                nonce.clone(),
+                NonceEntry {
+                    issued_at: now,
+                    ip: ip.to_string(),
+                    max_nc: 0,
+                },
+            );
+        }
         let www_auth = format!(
             "Digest realm=\"{}\", nonce=\"{}\", algorithm=MD5, qop=\"auth\"",
             self.domain, nonce
@@ -488,6 +582,46 @@ impl RegistrarService {
             "Unauthorized",
             &[("WWW-Authenticate", &www_auth)],
         )
+    }
+
+    /// 校验客户端回传的 Digest nonce 是否有效（防重放）：
+    ///
+    /// - 必须由本服务签发且未过期 → 阻断伪造 nonce 与过期重放；
+    /// - 来源 IP 必须与签发时一致 → 阻断"攻击者从自身地址重放嗅探到的合法认证包"
+    ///   （注册劫持的核心攻击路径）；
+    /// - `qop=auth` 时 `nc` 必须严格递增 → 阻断同 IP 内对同一 nonce 的序列号回退重放。
+    ///
+    /// 校验失败返回 `false`，调用方应重新发起 401 挑战（无效 nonce 无法通过认证）。
+    fn validate_nonce(&self, nonce: &str, ip: &str, nc: Option<u64>, qop: Option<&str>) -> bool {
+        let now = now_secs();
+        let mut nonces = self.issued_nonces.write().unwrap();
+
+        // 存在性 + 来源 IP 匹配 + 未过期（过期条目删除）
+        let expired = {
+            let entry = match nonces.get(nonce) {
+                Some(e) => e,
+                None => return false, // 未签发或已被清理
+            };
+            if entry.ip != ip {
+                return false; // 跨来源重放
+            }
+            now.saturating_sub(entry.issued_at) >= NONCE_TTL_SECS
+        };
+        if expired {
+            nonces.remove(nonce);
+            return false;
+        }
+
+        // qop=auth 时校验 nc 严格递增（阻断同 IP 内的序列号回退重放）
+        if qop == Some("auth") {
+            let nc = nc.unwrap_or(0);
+            let entry = nonces.get_mut(nonce).expect("nonce 上一步已确认存在");
+            if nc <= entry.max_nc {
+                return false;
+            }
+            entry.max_nc = nc;
+        }
+        true
     }
 
     /// 注册或更新分机
@@ -555,6 +689,17 @@ impl RegistrarService {
         if removed > 0 {
             tracing::info!("清理了 {} 个过期注册", removed);
         }
+
+        // 清理过期的 nonce（防止长时间运行累积无界内存）
+        drop(map);
+        let mut nonces = self.issued_nonces.write().unwrap();
+        nonces.retain(|nonce, entry| {
+            let alive = now.saturating_sub(entry.issued_at) < NONCE_TTL_SECS;
+            if !alive {
+                tracing::debug!("清理过期 nonce: {}", &nonce[..nonce.len().min(8)]);
+            }
+            alive
+        });
     }
 
     /// 启动后台清理任务
@@ -1068,5 +1213,187 @@ mod tests {
         }
         // 三次失败（三个不同端口）来自同一 IP → 应已封锁
         assert!(registrar.is_blocked("203.0.113.20"));
+    }
+
+    #[test]
+    fn register_replay_from_different_source_ip_rejected() {
+        // 攻击者从不同来源 IP 重放合法认证包：nonce 来源校验应拒绝（401 挑战），
+        // 且注册地址不得被劫持为攻击者来源。
+        let registrar = RegistrarService::new(
+            "example.com".to_string(),
+            "pw".to_string(),
+            HashMap::new(),
+            1000,
+            2000,
+            IpBlockPolicy::default(),
+            Vec::new(),
+        );
+        let legit_from: SocketAddr = "198.51.100.10:5061".parse().unwrap();
+
+        // 合法分机获取挑战并完成注册
+        let challenge = registrar.handle_register(
+            &register_request("1001", "replay-src", ""),
+            legit_from,
+            Transport::Tls,
+        );
+        let nonce = extract_nonce(&challenge);
+        let auth = digest_authorization("1001", "pw", "example.com", &nonce, "sip:example.com");
+        let ok = registrar.handle_register(
+            &register_request("1001", "replay-src", &auth),
+            legit_from,
+            Transport::Tls,
+        );
+        assert!(String::from_utf8(ok).unwrap().starts_with("SIP/2.0 200 OK"));
+
+        // 攻击者从不同来源 IP 原样重放同一认证包 → 应 401 而非 200
+        let attacker_from: SocketAddr = "203.0.113.77:5061".parse().unwrap();
+        let replay = registrar.handle_register(
+            &register_request("1001", "replay-src", &auth),
+            attacker_from,
+            Transport::Tls,
+        );
+        let text = String::from_utf8(replay).unwrap();
+        assert!(
+            text.starts_with("SIP/2.0 401 Unauthorized"),
+            "跨来源重放应被 401 拒绝，实际: {}",
+            text.lines().next().unwrap_or("")
+        );
+        // 注册地址未被劫持为攻击者来源
+        let reg = registrar.lookup("1001").unwrap();
+        assert_eq!(reg.transport_addr, legit_from);
+    }
+
+    #[test]
+    fn register_rejects_username_not_matching_to_header() {
+        // Authorization username 与 To 头分机号不一致 → 403（防共享密码跨分机冒充）
+        let registrar = RegistrarService::new(
+            "example.com".to_string(),
+            "pw".to_string(),
+            HashMap::new(),
+            1000,
+            2000,
+            IpBlockPolicy::default(),
+            Vec::new(),
+        );
+        let from: SocketAddr = "127.0.0.1:5061".parse().unwrap();
+        let challenge = registrar.handle_register(
+            &register_request("1001", "user-mismatch", ""),
+            from,
+            Transport::Tls,
+        );
+        let nonce = extract_nonce(&challenge);
+        // To 头是 1001，但 Authorization username 用 1002（同一默认密码仍能算出合法响应）
+        let auth = digest_authorization("1002", "pw", "example.com", &nonce, "sip:example.com");
+        let resp = registrar.handle_register(
+            &register_request("1001", "user-mismatch", &auth),
+            from,
+            Transport::Tls,
+        );
+        assert!(String::from_utf8(resp)
+            .unwrap()
+            .starts_with("SIP/2.0 403 Forbidden"));
+    }
+
+    #[test]
+    fn expired_nonce_is_rejected() {
+        let registrar = RegistrarService::new(
+            "example.com".to_string(),
+            "pw".to_string(),
+            HashMap::new(),
+            1000,
+            2000,
+            IpBlockPolicy::default(),
+            Vec::new(),
+        );
+        // 手工注入一条已过期的 nonce（签发时间在 TTL 之前）
+        {
+            let mut nonces = registrar.issued_nonces.write().unwrap();
+            nonces.insert(
+                "stale-nonce".to_string(),
+                NonceEntry {
+                    issued_at: now_secs() - NONCE_TTL_SECS - 1,
+                    ip: "127.0.0.1".to_string(),
+                    max_nc: 0,
+                },
+            );
+        }
+        assert!(!registrar.validate_nonce("stale-nonce", "127.0.0.1", None, None));
+        // 过期条目应被移除
+        assert!(!registrar
+            .issued_nonces
+            .read()
+            .unwrap()
+            .contains_key("stale-nonce"));
+    }
+
+    #[test]
+    fn nonce_reuse_with_same_nc_rejected_when_qop_auth() {
+        let registrar = RegistrarService::new(
+            "example.com".to_string(),
+            "pw".to_string(),
+            HashMap::new(),
+            1000,
+            2000,
+            IpBlockPolicy::default(),
+            Vec::new(),
+        );
+        // 先"签发"一条 nonce（模拟服务器发出的挑战）
+        {
+            let mut nonces = registrar.issued_nonces.write().unwrap();
+            nonces.insert(
+                "n1".to_string(),
+                NonceEntry {
+                    issued_at: now_secs(),
+                    ip: "1.1.1.1".to_string(),
+                    max_nc: 0,
+                },
+            );
+        }
+        // 同 IP 同 nonce：nc 递增放行，重复 nc / 回退拒绝
+        assert!(registrar.validate_nonce("n1", "1.1.1.1", Some(2), Some("auth")));
+        assert!(!registrar.validate_nonce("n1", "1.1.1.1", Some(2), Some("auth")));
+        assert!(registrar.validate_nonce("n1", "1.1.1.1", Some(3), Some("auth")));
+        // 不同 IP 复用同一 nonce 被拒
+        assert!(!registrar.validate_nonce("n1", "2.2.2.2", Some(4), Some("auth")));
+    }
+
+    #[test]
+    fn issued_nonces_table_is_capped() {
+        let registrar = RegistrarService::new(
+            "example.com".to_string(),
+            "pw".to_string(),
+            HashMap::new(),
+            1000,
+            2000,
+            IpBlockPolicy::default(),
+            Vec::new(),
+        );
+        // 预填到上限（全部未过期），再签发应触发"清理/清空 + 重插"而非无界增长
+        {
+            let now = now_secs();
+            let mut nonces = registrar.issued_nonces.write().unwrap();
+            for i in 0..MAX_ISSUED_NONCES {
+                nonces.insert(
+                    format!("prefill-{}", i),
+                    NonceEntry {
+                        issued_at: now,
+                        ip: "127.0.0.1".to_string(),
+                        max_nc: 0,
+                    },
+                );
+            }
+        }
+        let resp = registrar.digest_challenge(
+            &register_request("1001", "cap-test", ""),
+            "1001",
+            "127.0.0.1",
+        );
+        assert!(String::from_utf8(resp).unwrap().starts_with("SIP/2.0 401"));
+        let len = registrar.issued_nonces.read().unwrap().len();
+        assert!(
+            len <= MAX_ISSUED_NONCES,
+            "nonce 表不应超过上限, len={}",
+            len
+        );
     }
 }

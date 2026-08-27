@@ -199,6 +199,7 @@ impl Router {
         request_text: &str,
         caller_sink: ConnectionSink,
         from_addr: SocketAddr,
+        connection_ext: Option<&str>,
     ) -> Vec<u8> {
         let ip = from_addr.ip().to_string();
 
@@ -228,6 +229,55 @@ impl Router {
             );
             self.registrar.record_failure(&ip);
             return parser::build_response(request_text, 403, "Forbidden");
+        }
+
+        // 连接身份绑定：发起 INVITE 的连接必须已认证为 From 头中的分机，
+        // 阻断"未认证连接冒用在线分机号发起呼叫"（Caller Spoofing）。
+        match connection_ext {
+            // 连接已认证且身份一致：放行
+            Some(ext) if ext == caller_ext => {}
+            // 连接认证身份与 From 头不一致：拒绝
+            Some(ext) => {
+                tracing::warn!(
+                    ip = %ip,
+                    "连接认证分机 {} 与 INVITE From 头分机 {} 不一致，拒绝冒充呼叫",
+                    ext,
+                    caller_ext
+                );
+                self.registrar.record_failure(&ip);
+                return parser::build_response(request_text, 403, "Forbidden");
+            }
+            // 连接未绑定认证分机：
+            None => {
+                if caller_sink.transport() == Transport::Udp {
+                    // 明文 UDP 分机经 NAT 重绑定后来源端口会变化，连接层可能取不到
+                    // extension。此时回退校验"来源 IP 与该分机注册来源 IP 一致"，
+                    // 仍阻断跨 IP 的 From 伪造。
+                    let ip_ok = self
+                        .registrar
+                        .lookup(&caller_ext)
+                        .map(|reg| reg.transport_addr.ip() == from_addr.ip())
+                        .unwrap_or(false);
+                    if !ip_ok {
+                        tracing::warn!(
+                            ip = %ip,
+                            "未认证 UDP 来源冒用在线分机 {} 发起 INVITE，拒绝",
+                            caller_ext
+                        );
+                        self.registrar.record_failure(&ip);
+                        return parser::build_response(request_text, 403, "Forbidden");
+                    }
+                } else {
+                    // TLS 连接未完成 REGISTER 认证：拒绝呼叫
+                    tracing::warn!(
+                        ip = %ip,
+                        "未认证 TLS 连接冒用在线分机 {} 发起 INVITE，拒绝",
+                        caller_ext
+                    );
+                    self.registrar.record_failure(&ip);
+                    return parser::build_response(request_text, 403, "Forbidden");
+                }
+            }
         }
 
         let call_id = parser::extract_call_id(request_text).unwrap_or_default();
@@ -744,24 +794,42 @@ impl Router {
             bye_from_callee = !bye_from_tag.is_empty()
                 && call.callee_tag.as_deref() == Some(bye_from_tag.as_str());
 
-            // 确定对端的发送出口
-            if bye_from_caller {
+            // 身份校验：仅接受由呼叫任一方发起的 BYE。
+            // 1) tag 与对话匹配（标准场景）；
+            // 2) 早媒体等对话 tag 尚未建立时，回退到"连接认证身份"精确匹配
+            //    主叫/被叫分机（该身份来自连接层认证，不信任 From 头）。
+            // 其余（未认证连接或身份不明）一律视为未授权挂断请求，拒绝转发与拆线。
+            let conn_is_caller = !from_extension.is_empty() && from_extension == call.caller_ext;
+            let conn_is_callee = !from_extension.is_empty() && from_extension == call.callee_ext;
+            if !bye_from_caller && !bye_from_callee && !conn_is_caller && !conn_is_callee {
+                tracing::warn!(
+                    "BYE 身份无法验证 (caller_tag={}, callee_tag={:?}, from_tag={}, conn_ext={})，拒绝未授权挂断 Call-ID={}",
+                    call.caller_tag,
+                    call.callee_tag,
+                    bye_from_tag,
+                    from_extension,
+                    call_id
+                );
+                return parser::build_response(
+                    request_text,
+                    481,
+                    "Call/Transaction Does Not Exist",
+                );
+            }
+
+            // 确定对端的发送出口：主叫方挂断 → 转发给被叫；被叫方挂断 → 转发给主叫。
+            // 优先以对话 tag 判定；早媒体等 tag 未建立时以连接认证身份判定。
+            let bye_from_caller_side = bye_from_caller || conn_is_caller;
+            let bye_from_callee_side = bye_from_callee || conn_is_callee;
+            if bye_from_caller_side && !bye_from_callee_side {
                 other_sink = call.callee_sink.clone();
                 target_uri = call.callee_remote_contact.clone().unwrap_or_else(|| {
                     registered_contact_uri(&call.callee_ext, &self.domain, &self.registrar)
                 });
-            } else if bye_from_callee || from_extension != call.caller_ext {
-                // 由被叫发出（或无法按 tag 识别时，按旧逻辑默认视为被叫侧）
+            } else {
                 other_sink = Some(call.caller_sink.clone());
                 target_uri = call.caller_remote_contact.clone().unwrap_or_else(|| {
                     registered_contact_uri(&call.caller_ext, &self.domain, &self.registrar)
-                });
-            } else {
-                // from_extension 明确为主叫但 tag 无法匹配（异常呼叫/早媒体）：
-                // 仍视为主叫挂断，转发给被叫
-                other_sink = call.callee_sink.clone();
-                target_uri = call.callee_remote_contact.clone().unwrap_or_else(|| {
-                    registered_contact_uri(&call.callee_ext, &self.domain, &self.registrar)
                 });
             }
         }
@@ -847,6 +915,23 @@ impl Router {
                     );
                 }
             };
+
+            // 对话身份校验：CANCEL 由主叫发出，From tag 必须与 INVITE 的主叫 tag 一致，
+            // 阻断第三方伪造 CANCEL 取消他人进行中的呼叫。
+            let cancel_from_tag = parser::extract_from_tag(request_text).unwrap_or_default();
+            if cancel_from_tag.is_empty() || cancel_from_tag != call.caller_tag {
+                tracing::warn!(
+                    "CANCEL From tag ({}) 与主叫 tag ({}) 不一致，拒绝未授权取消 Call-ID={}",
+                    cancel_from_tag,
+                    call.caller_tag,
+                    call_id
+                );
+                return parser::build_response(
+                    request_text,
+                    481,
+                    "Call/Transaction Does Not Exist",
+                );
+            }
 
             call.state = CallState::Terminated;
             callee_sink = call.callee_sink.clone();
@@ -2078,7 +2163,9 @@ mod tests {
 
         // 未注册主叫的 INVITE（攻击者探测）应被拒绝 403，且每次计入该 IP 失败
         for _ in 0..3 {
-            let resp = router.handle_invite(&invite, sink.clone(), from).await;
+            let resp = router
+                .handle_invite(&invite, sink.clone(), from, None)
+                .await;
             assert_eq!(
                 parser::extract_status_code(&String::from_utf8(resp).unwrap()),
                 Some(403)
@@ -2089,7 +2176,7 @@ mod tests {
         assert!(router.registrar.is_blocked("203.0.113.50"));
 
         // 封锁后再次 INVITE 仍被直接拒绝
-        let resp = router.handle_invite(&invite, sink.clone(), from).await;
+        let resp = router.handle_invite(&invite, sink.clone(), from, None).await;
         assert_eq!(
             parser::extract_status_code(&String::from_utf8(resp).unwrap()),
             Some(403)
@@ -2123,9 +2210,123 @@ mod tests {
             "Content-Length: 0\r\n\r\n"
         );
 
-        let resp = router.handle_invite(&invite, sink, from).await;
+        // 连接已认证为 1001（connection_ext=Some("1001")），From 头也写 1001 → 合法主叫。
+        // 被叫 1002 未注册 → 应返回 404（而非 403 身份拒绝）。
+        let resp = router
+            .handle_invite(&invite, sink, from, Some("1001"))
+            .await;
         let code = parser::extract_status_code(&String::from_utf8(resp).unwrap());
         // 合法主叫不应被 403 拦截；被叫 1002 未注册 → 应返回 404
         assert_eq!(code, Some(404));
+    }
+
+    #[tokio::test]
+    async fn invite_from_registered_extension_without_authenticated_connection_rejected() {
+        // 主叫分机 1001 在线，但发起连接未认证（connection_ext=None，TLS）
+        // → 冒用呼叫必须被 403 拒绝（Caller Spoofing 防御）。
+        let (router, caller_tx, _caller_rx, _callee_tx, _callee_rx) = test_router_with_sinks();
+        let sink = ConnectionSink::Stream(caller_tx);
+        let from: SocketAddr = "127.0.0.1:5061".parse().unwrap();
+
+        // 模拟 1001 已注册（在线）
+        router
+            .registrar
+            .register(crate::sip::registrar::Registration {
+                extension: "1001".to_string(),
+                contact: "<sip:1001@client.invalid>".to_string(),
+                expires_at: u64::MAX,
+                transport_addr: "127.0.0.1:5061".parse().unwrap(),
+                transport: Transport::Tls,
+            });
+
+        let invite = concat!(
+            "INVITE sip:1002@example.com SIP/2.0\r\n",
+            "Via: SIP/2.0/TLS client.example.com;branch=z9hG4bKinv3\r\n",
+            "From: <sip:1001@example.com>;tag=tag3\r\n",
+            "To: <sip:1002@example.com>\r\n",
+            "Call-ID: cid-spoof\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Content-Length: 0\r\n\r\n"
+        );
+
+        // 连接未认证（None）→ TLS 未认证连接冒用在线分机 → 403
+        let resp = router.handle_invite(&invite, sink, from, None).await;
+        let code = parser::extract_status_code(&String::from_utf8(resp).unwrap());
+        assert_eq!(code, Some(403));
+    }
+
+    #[tokio::test]
+    async fn bye_with_unverifiable_identity_rejected_481() {
+        // 未认证连接（from_extension 为空）且 From tag 与对话不匹配的 BYE
+        // → 未授权挂断请求：必须 481 且不拆线。
+        let (router, caller_tx, _caller_rx, callee_tx, _callee_rx) = test_router_with_sinks();
+        insert_established_call(
+            &router,
+            "call-bye-guard",
+            "1001",
+            "caller-tag",
+            "1002",
+            "callee-tag",
+            caller_tx,
+            callee_tx,
+        );
+
+        // 攻击者伪造 BYE：From tag 与 caller/callee tag 均不匹配，连接未认证
+        let bye = concat!(
+            "BYE sip:1001@example.com SIP/2.0\r\n",
+            "Via: SIP/2.0/UDP attacker.invalid;branch=z9hG4bKbyespoof\r\n",
+            "From: <sip:1001@example.com>;tag=forged-tag\r\n",
+            "To: <sip:1002@example.com>;tag=caller-tag\r\n",
+            "Call-ID: call-bye-guard\r\n",
+            "CSeq: 2 BYE\r\n",
+            "Content-Length: 0\r\n\r\n"
+        );
+        let response = router.handle_bye(bye, "").await;
+        assert!(
+            String::from_utf8_lossy(&response).contains("481"),
+            "身份无法验证的 BYE 应返回 481，实际: {}",
+            String::from_utf8_lossy(&response).lines().next().unwrap_or("")
+        );
+        // 呼叫未被拆线
+        assert!(router.has_active_call("call-bye-guard"));
+    }
+
+    #[tokio::test]
+    async fn bye_early_media_with_authenticated_connection_forwards() {
+        // 早媒体场景：对话 tag 未建立，但连接已认证为主叫 1001
+        // → 放行挂断（转发给被叫），不能误拒合法挂断。
+        let (router, caller_tx, _caller_rx, _callee_tx, mut callee_rx) = test_router_with_sinks();
+        insert_established_call(
+            &router,
+            "call-bye-early",
+            "1001",
+            "caller-tag",
+            "1002",
+            "callee-tag",
+            caller_tx,
+            _callee_tx,
+        );
+
+        // tag 用不匹配的值模拟"对话 tag 未建立/未知"；连接身份 1001（已认证主叫）
+        let bye = concat!(
+            "BYE sip:1002@example.com SIP/2.0\r\n",
+            "Via: SIP/2.0/TLS caller.example.com;branch=z9hG4bKbyeearly\r\n",
+            "From: <sip:1001@example.com>;tag=unknown-tag\r\n",
+            "To: <sip:1002@example.com>;tag=caller-tag\r\n",
+            "Call-ID: call-bye-early\r\n",
+            "CSeq: 2 BYE\r\n",
+            "Content-Length: 0\r\n\r\n"
+        );
+        let response = router.handle_bye(bye, "1001").await;
+        assert!(
+            String::from_utf8_lossy(&response).contains("200 OK"),
+            "已认证主叫的早媒体挂断应放行"
+        );
+        // 被叫应收到转发的 BYE
+        let forwarded = tokio::time::timeout(std::time::Duration::from_secs(1), callee_rx.recv())
+            .await
+            .expect("应收到转发的 BYE")
+            .expect("通道应正常");
+        assert!(String::from_utf8_lossy(&forwarded).contains("BYE"));
     }
 }

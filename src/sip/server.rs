@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -23,6 +24,18 @@ use super::transport::{ConnectionSink, Transport};
 use crate::config::AppConfig;
 use crate::media::relay::MediaRelayManager;
 use crate::tls::ReloadableTlsAcceptor;
+
+/// 连接空闲超时（秒）：超过该时长连接无任何数据（含 keepalive）即断开，
+/// 防止攻击者批量建立"握手后挂起"的空闲连接耗尽文件句柄与内存。
+const CONNECTION_IDLE_TIMEOUT_SECS: u64 = 60;
+
+/// TLS 握手超时（秒）：客户端建立 TCP 连接后须在此时长内完成 TLS 握手，
+/// 防止攻击者批量建连后挂起 ClientHello 占用文件句柄（绕过 idle 超时）。
+const HANDSHAKE_TIMEOUT_SECS: u64 = 10;
+
+/// 全局并发连接/会话上限（含 TLS 连接、进行中的 TLS 握手与 UDP 会话条目）：
+/// 达到上限后拒绝新连接，防止无界增长耗尽资源。
+const MAX_CONNECTIONS: usize = 1024;
 
 /// 连接状态
 struct ConnectionState {
@@ -42,6 +55,9 @@ pub struct ServerState {
     pub transaction_mgr: Arc<TransactionManager>,
     /// 连接映射：peer_addr -> ConnectionState
     connections: RwLock<HashMap<SocketAddr, ConnectionState>>,
+    /// 进行中（尚未完成）的 TLS 握手计数：计入并发上限统计，
+    /// 防止攻击者批量建 TCP 连接后挂起 ClientHello 绕过连接上限。
+    pending_handshakes: AtomicUsize,
 }
 
 impl ServerState {
@@ -136,6 +152,7 @@ pub async fn run(
         router,
         transaction_mgr,
         connections: RwLock::new(HashMap::new()),
+        pending_handshakes: AtomicUsize::new(0),
     });
 
     // 明文 UDP 信令：启动数据报监听与会话清理任务
@@ -164,21 +181,57 @@ pub async fn run(
 
     loop {
         let (tcp_stream, peer_addr) = listener.accept().await?;
+
+        // 并发连接/会话上限保护：已建立连接(含 UDP 会话) + 进行中的 TLS 握手
+        // 合计达到上限即拒绝新连接。把握手阶段也计入，防止攻击者批量建连后
+        // 挂起 ClientHello 绕过上限耗尽文件句柄。
+        {
+            let established = state.connections.read().unwrap().len();
+            let pending = state.pending_handshakes.load(Ordering::SeqCst);
+            if established + pending >= MAX_CONNECTIONS {
+                tracing::warn!(
+                    "并发连接/会话已达上限 ({}), 拒绝新连接: {}",
+                    MAX_CONNECTIONS,
+                    peer_addr
+                );
+                drop(tcp_stream);
+                continue;
+            }
+            state.pending_handshakes.fetch_add(1, Ordering::SeqCst);
+        }
+
         tracing::info!("新的 TCP 连接来自: {}", peer_addr);
 
         let tls_acceptor = tls_acceptor.current();
         let state = Arc::clone(&state);
 
         tokio::spawn(async move {
-            match tls_acceptor.accept(tcp_stream).await {
-                Ok(tls_stream) => {
+            // TLS 握手加超时：客户端必须在 HANDSHAKE_TIMEOUT_SECS 内完成握手，
+            // 防止"只建连不握手"挂起占用资源。
+            let handshake = tokio::time::timeout(
+                Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
+                tls_acceptor.accept(tcp_stream),
+            )
+            .await;
+            // 握手结束（无论成败）即释放握手计数
+            state.pending_handshakes.fetch_sub(1, Ordering::SeqCst);
+
+            match handshake {
+                Ok(Ok(tls_stream)) => {
                     tracing::info!("TLS 握手成功: {}", peer_addr);
                     if let Err(e) = handle_connection(tls_stream, peer_addr, state).await {
                         tracing::error!("处理连接 {} 时出错: {}", peer_addr, e);
                     }
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     tracing::warn!("TLS 握手失败 ({}): {}", peer_addr, e);
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        "TLS 握手超时 ({}s)，断开: {}",
+                        HANDSHAKE_TIMEOUT_SECS,
+                        peer_addr
+                    );
                 }
             }
         });
@@ -271,14 +324,26 @@ async fn handle_connection(
     let mut read_buf = [0u8; 8192];
 
     'read_loop: loop {
-        let n = match reader.read(&mut read_buf).await {
-            Ok(0) => {
+        // idle 超时保护：连接在 CONNECTION_IDLE_TIMEOUT_SECS 内无任何数据即断开，
+        // 防止攻击者批量保持空闲连接耗尽资源。合法客户端会周期性发送
+        // keepalive（CRLF 空包 / OPTIONS），不会触发。
+        let read_result = tokio::time::timeout(
+            Duration::from_secs(CONNECTION_IDLE_TIMEOUT_SECS),
+            reader.read(&mut read_buf),
+        )
+        .await;
+        let n = match read_result {
+            Ok(Ok(0)) => {
                 tracing::info!("连接关闭: {}", peer_addr);
                 break;
             }
-            Ok(n) => n,
-            Err(e) => {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => {
                 tracing::error!("读取错误 ({}): {}", peer_addr, e);
+                break;
+            }
+            Err(_elapsed) => {
+                tracing::info!("连接空闲超时 ({}s)，断开: {}", CONNECTION_IDLE_TIMEOUT_SECS, peer_addr);
                 break;
             }
         };
@@ -409,9 +474,12 @@ async fn process_sip_message(
                 }
             }
             "INVITE" => {
+                // 传入连接认证的分机号（Option）：INVITE 必须由已认证为 From 头的
+                // 连接发起，阻断未认证连接冒用在线分机（Caller Spoofing）。
+                let conn_ext = state.get_connection_extension(&peer_addr);
                 let response = state
                     .router
-                    .handle_invite(msg_text, sink.clone(), peer_addr)
+                    .handle_invite(msg_text, sink.clone(), peer_addr, conn_ext.as_deref())
                     .await;
                 if let Err(e) = sink.send(response).await {
                     tracing::error!("发送 INVITE 响应失败 ({}): {}", peer_addr, e);
@@ -421,15 +489,11 @@ async fn process_sip_message(
                 state.router.handle_ack(msg_text).await;
             }
             "BYE" => {
-                // from_extension 用于 BYE 转发方向判断。UDP 设备经 NAT 重绑定后
-                // 来源地址（尤其端口）可能变化，连接层 exact match 会失败；
-                // 此时回退到 From 头提取分机号（消息级身份，UDP/TLS 都携带）。
+                // 仅使用连接认证的分机号作为 BYE 身份依据（不信任 From 头，
+                // 否则未认证连接可伪造 From 冒充挂断他人呼叫）。UDP 设备经 NAT
+                // 重绑定后来源端口变化可能取不到，此时回退到对话 tag 校验。
                 let from_ext = state
                     .get_connection_extension(&peer_addr)
-                    .or_else(|| {
-                        parser::extract_uri_from_header(msg_text, "From")
-                            .and_then(|uri| parser::extract_extension(&uri))
-                    })
                     .unwrap_or_default();
                 let response = state.router.handle_bye(msg_text, &from_ext).await;
                 if let Err(e) = sink.send(response).await {

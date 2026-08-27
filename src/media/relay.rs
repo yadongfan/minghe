@@ -241,12 +241,13 @@ pub async fn run_relay(
                     if n == 0 {
                         continue;
                     }
-                    // 学习/更新主叫方地址
+                    // 锁定主叫方地址：仅首次学习，之后拒绝来源变更。
+                    // 防止攻击者向中继端口注入伪造源地址的包来重定向/劫持媒体流。
                     {
                         let mut remote = cr1.lock().await;
-                        if *remote != Some(addr) {
-                            tracing::debug!("[{}] 学习到主叫方地址: {}", cid1, addr);
+                        if remote.is_none() {
                             *remote = Some(addr);
+                            tracing::info!("[{}] 锁定主叫方媒体地址: {}", cid1, addr);
                         }
                     }
                     // SRTP 模式：解密 → 重加密
@@ -321,12 +322,13 @@ pub async fn run_relay(
                     if n == 0 {
                         continue;
                     }
-                    // 学习/更新被叫方地址
+                    // 锁定被叫方地址：仅首次学习，之后拒绝来源变更。
+                    // 防止攻击者向中继端口注入伪造源地址的包来重定向/劫持媒体流。
                     {
                         let mut remote = cr3.lock().await;
-                        if *remote != Some(addr) {
-                            tracing::debug!("[{}] 学习到被叫方地址: {}", cid2, addr);
+                        if remote.is_none() {
                             *remote = Some(addr);
+                            tracing::info!("[{}] 锁定被叫方媒体地址: {}", cid2, addr);
                         }
                     }
                     // SRTP 模式：解密 → 重加密
